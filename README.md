@@ -26,8 +26,9 @@ https://liam8888999.github.io/silo-kodi/
 
 ### Libraries, browsing and discovery
 
-* Browse movies, TV series, seasons and episodes from your Silo libraries.
-* Search your library, including people, and browse person-related media where supported by the server.
+* Browse movies, TV series, seasons, episodes and TMDB Box Sets from libraries where Box Set grouping is enabled on the server.
+* Open Box Sets to view their movies in release order, with the normal movie artwork, watched/resume state and playback actions.
+* Search your library, including people and matching Box Sets, and browse person-related media where supported by the server.
 * Browse Silo Home sections and Discover recommendations.
 * View personal lists including Watchlist, Favourites and history, and access personal collections.
 * Browse large libraries with automatic API pagination rather than manually navigating page numbers.
@@ -41,6 +42,7 @@ https://liam8888999.github.io/silo-kodi/
 * Report Kodi playback progress to Silo Server approximately every five seconds, so progress is shared with other clients.
 * Use the latest server-side resume position with Kodi's native Resume / Start from beginning prompt.
 * Report playback capabilities to Silo Server, including supported video/audio and display HDR details where Kodi exposes them, to help the server plan playback.
+* Negotiate server-supported HLS subtitle renditions so compatible embedded text tracks can be offered by Kodi's native player.
 * Skip available intro, recap and credits segments. You can choose prompts or enable automatic skipping separately for intros, recaps and credits in the add-on settings.
 * Support server-side playback termination, which stops the active Kodi stream when Silo Server revokes or terminates its session.
 
@@ -55,6 +57,12 @@ https://liam8888999.github.io/silo-kodi/
 ## 📝 Changelog
 
 The release history below records the features and fixes introduced in the versions for which notes are available. Some older releases are omitted because no notes were supplied for them.
+
+*** V1.1.21 ***
+* Add TMDB Box Set browsing and search for libraries where the server enables grouping
+* Show Box Set collection artwork and per-film watched/resume state, retaining normal movie playback
+* Negotiate server-supported HLS subtitle renditions, including all advertised embedded text tracks
+* Retry safe API reads after HTTP 429 using bounded Retry-After-aware backoff
 
 *** V1.1.20 ***
 * Add support for adding/removing items from Favourites and Watchlist, and marking items watched/unwatched on the server (native Kodi buttons may still appear)

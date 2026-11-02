@@ -397,7 +397,7 @@ def paginate_directory(items, page):
 
 
 def add_previous_page(library_id=None, series_id=None, season_number=None,
-                      action=None, page=1, letter=None):
+                      action=None, page=1, letter=None, box_sets_enabled=None):
     """Add a Previous Page folder when the current directory is past page 1."""
     try:
         page_number = int(page or 1)
@@ -420,6 +420,8 @@ def add_previous_page(library_id=None, series_id=None, season_number=None,
         params["season_number"] = season_number
     if letter:
         params["letter"] = letter
+    if box_sets_enabled is not None:
+        params["box_sets_enabled"] = int(bool(box_sets_enabled))
 
     item = xbmcgui.ListItem(label="Previous Page")
     _directory_art(item, "folder-page")
@@ -507,6 +509,9 @@ def fetch_detail_metadata(client, items, library_id, max_workers=4, per_item_lib
     seen = set()
 
     for index, item in enumerate(items):
+        media_type = str(item.get("type") or item.get("media_type") or "").lower()
+        if media_type == "box_set":
+            continue
         content_id = get_content_id(item)
         if not content_id:
             continue
@@ -955,10 +960,16 @@ def fetch_series_watch_data(client, items, library_id=None, max_workers=4, detai
 def prepare_catalog_watch_state(client, items, detail_map, library_id=None):
     """Avoid redundant /progress and season calls when detail already has state."""
     detail_map = detail_map or {}
+    watch_items = [
+        item for item in items
+        if str(item.get("type") or item.get("media_type") or "").lower() != "box_set"
+    ]
+    if not watch_items:
+        return {}, {}, {}
     progress_map = {}
     fallback_needed = False
 
-    for item in items:
+    for item in watch_items:
         content_id = get_content_id(item)
         if not content_id:
             continue
@@ -998,7 +1009,7 @@ def prepare_catalog_watch_state(client, items, detail_map, library_id=None):
 
     series_watch_map, season_watch_map = fetch_series_watch_data(
         client,
-        items,
+        watch_items,
         library_id=library_id,
         detail_map=detail_map,
     )
@@ -2366,6 +2377,47 @@ def get_content_id(item):
     return item.get("content_id") or item.get("id")
 
 
+def get_box_set_id(item):
+    """Return the TMDB collection ID represented by a Box Set catalog card."""
+    if not isinstance(item, dict):
+        return ""
+    box_set = item.get("box_set")
+    if isinstance(box_set, dict) and box_set.get("id") not in (None, ""):
+        return str(box_set.get("id"))
+    content_id = str(get_content_id(item) or "")
+    prefix = "box_set:"
+    return content_id[len(prefix):] if content_id.startswith(prefix) else ""
+
+
+def box_set_search_catalog_item(box_set):
+    """Adapt a Box Set search result into the shared Kodi card shape."""
+    if not isinstance(box_set, dict):
+        return {}
+    collection_id = str(box_set.get("id") or "").strip()
+    if not collection_id:
+        return {}
+    try:
+        movie_count = max(0, int(box_set.get("movie_count") or 0))
+        played_count = max(0, int(box_set.get("played_count") or 0))
+    except (TypeError, ValueError):
+        movie_count = played_count = 0
+
+    return {
+        "content_id": "box_set:%s" % collection_id,
+        "type": "box_set",
+        "title": box_set.get("title") or "Box Set",
+        "overview": box_set.get("overview") or "",
+        "year": box_set.get("first_year") or 0,
+        "poster_url": box_set.get("poster_url") or "",
+        "poster_thumbhash": box_set.get("poster_thumbhash") or "",
+        "backdrop_url": box_set.get("backdrop_url") or "",
+        "backdrop_thumbhash": box_set.get("backdrop_thumbhash") or "",
+        "library_id": box_set.get("library_id"),
+        "user_state": {"played": movie_count > 0 and played_count >= movie_count},
+        "box_set": dict(box_set),
+    }
+
+
 def add_catalog_item(client, item, library_id):
     """Convert one Silo catalog object into a Kodi ListItem."""
     content_id = get_content_id(item)
@@ -2693,6 +2745,9 @@ def display_title_for_catalog_item(catalog_item):
         or ""
     ).lower()
 
+    if media_type == "box_set":
+        return "[Box Set] %s" % title
+
     if media_type == "movie":
         return "[Movie] %s" % title
 
@@ -2886,6 +2941,16 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
 
     display_progress = progress if progress is not None else catalog_progress(catalog_item)
     set_watch_state(item, display_progress, media_type)
+    if media_type == "box_set":
+        box_set = catalog_item.get("box_set") or {}
+        for field, property_name in (
+            ("movie_count", "Silo.BoxSet.MovieCount"),
+            ("played_count", "Silo.BoxSet.PlayedCount"),
+            ("first_year", "Silo.BoxSet.FirstYear"),
+            ("last_year", "Silo.BoxSet.LastYear"),
+        ):
+            if box_set.get(field) is not None:
+                item.setProperty(property_name, str(box_set.get(field)))
 
     if media_type == "series":
         set_container_watch_state(item, series_rollup)
@@ -2916,8 +2981,10 @@ def list_search_results(client, query, page=1):
     # separate requests.Session so concurrent requests do not share session state.
     people_client = SiloClient()
     people_client.cfg.update(client.cfg)
+    box_sets_client = SiloClient()
+    box_sets_client.cfg.update(client.cfg)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         media_future = executor.submit(
             client.search_catalog,
             query,
@@ -2929,6 +2996,11 @@ def list_search_results(client, query, page=1):
             query,
             limit=50,
         )
+        box_sets_future = executor.submit(
+            box_sets_client.search_box_sets,
+            query,
+            limit=10,
+        )
 
         try:
             data = media_future.result() or {}
@@ -2939,6 +3011,7 @@ def list_search_results(client, query, page=1):
             )
             notify("Search failed: %s" % str(exc)[:180])
             people_future.cancel()
+            box_sets_future.cancel()
             xbmcplugin.endOfDirectory(HANDLE)
             return
 
@@ -2954,6 +3027,19 @@ def list_search_results(client, query, page=1):
             )
             people = []
 
+        try:
+            box_sets = box_sets_future.result() or []
+        except SiloError as exc:
+            log(
+                "Silo Box Set search failed for %r: %s" % (query, exc),
+                xbmc.LOGWARNING,
+            )
+            box_sets = []
+
+    log(
+        "Silo search query=%r returned %d Box Set result(s)"
+        % (query, len(box_sets))
+    )
     log(
         "Silo search query=%r returned %d person result(s)"
         % (query, len(people))
@@ -2969,6 +3055,34 @@ def list_search_results(client, query, page=1):
         "Search: %s" % query,
     )
     xbmcplugin.setContent(HANDLE, "videos")
+
+    # Box Sets appear ahead of their member movies in catalog search.
+    if page_number == 1 and box_sets:
+        for box_set in box_sets:
+            catalog_card = box_set_search_catalog_item(box_set)
+            if not catalog_card:
+                continue
+            list_item, _media_type, _content_id, _title, _progress = build_catalog_list_item(
+                client,
+                catalog_card,
+                progress=catalog_progress(catalog_card),
+            )
+            box_set_id = get_box_set_id(catalog_card)
+            library_id = box_set.get("library_id")
+            if not box_set_id or not library_id:
+                continue
+            list_item.setProperty("Silo.BoxSetID", box_set_id)
+            list_item.setProperty("Silo.LibraryID", str(library_id))
+            xbmcplugin.addDirectoryItem(
+                HANDLE,
+                build_url(
+                    action="box_set",
+                    box_set_id=box_set_id,
+                    library_id=library_id,
+                ),
+                list_item,
+                True,
+            )
 
     # People are shown before media so a matching actor/director
     # can be selected directly from the normal Search directory.
@@ -3127,7 +3241,7 @@ def list_search_results(client, query, page=1):
         xbmcplugin.addDirectoryItems(
             HANDLE,
             batch,
-            totalItems=len(ordered_items) + (1 if has_more else 0),
+            totalItems=len(ordered_items) + len(box_sets) + (1 if has_more else 0),
         )
 
     if has_more:
@@ -3144,7 +3258,7 @@ def list_search_results(client, query, page=1):
             True,
         )
 
-    if not items and not people:
+    if not items and not people and not box_sets:
         notify("No results found for: %s" % query)
 
     xbmcplugin.endOfDirectory(HANDLE)
@@ -6881,7 +6995,11 @@ def list_libraries(client):
 
         batch.append(
             (
-                build_url(action="library", library_id=library_id),
+                build_url(
+                    action="library",
+                    library_id=library_id,
+                    box_sets_enabled=int(library.get("box_sets_enabled") is True),
+                ),
                 item,
                 True,
             )
@@ -7141,17 +7259,14 @@ def _render_catalog_items(client, data, section_title=None, merged_group_key=Non
 
 
 
-def list_library(client, library_id, cursor=None):
+def list_library(client, library_id, cursor=None, box_sets_enabled=False):
     """Display the compact A-Z index for one Silo library."""
     if not library_id:
         raise SiloError("No library ID was supplied.")
 
-    # Keep one lightweight full-catalog traversal so the existing
-    # punctuation-tolerant 0-9/A-Z/# counts remain exact.
-    items = client.catalog(
-        library_id,
-        limit=200,
-    )
+    group = "box_set" if box_sets_enabled else None
+    # Count the same grouped list the user will browse below.
+    items = client.catalog(library_id, limit=200, group=group)
 
     counts = library_letter_counts(items)
 
@@ -7177,6 +7292,7 @@ def list_library(client, library_id, cursor=None):
                 letter=group,
                 page=1,
                 expected_count=count,
+                box_sets_enabled=int(box_sets_enabled),
             ),
             item,
             True,
@@ -7184,7 +7300,8 @@ def list_library(client, library_id, cursor=None):
 
     xbmcplugin.endOfDirectory(HANDLE)
 
-def list_library_letter(client, library_id, letter, page=None, expected_count=None):
+def list_library_letter(client, library_id, letter, page=None, expected_count=None,
+                        box_sets_enabled=False):
     """Display one alphabet group using Silo's indexed prefix query when safe."""
     if not library_id:
         raise SiloError("No library ID was supplied.")
@@ -7198,14 +7315,17 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
     except (TypeError, ValueError):
         page_number = 1
 
+    group = "box_set" if box_sets_enabled else None
     grouped_items = None
     server_prefix_validated = False
     server_has_more = False
 
-    # Silo's name_prefix is indexed and exactly matches the normal title sort
-    # key.  The add-on's old grouping ignores leading punctuation, so validate
-    # page 1 against the exact count from our alphabet index before trusting it.
-    if len(letter) == 1 and letter.isalpha():
+    # For ordinary catalog cards, Silo's indexed prefix follows the same
+    # title key the Kodi alphabet folders display. Box Set cards are different:
+    # the server indexes their representative movie, while Kodi groups the
+    # visible Box Set title. Use the local grouped-list path for Box Sets so
+    # pages remain consistent with the displayed letter and its item count.
+    if not group and len(letter) == 1 and letter.isalpha():
         try:
             expected = int(expected_count)
         except (TypeError, ValueError):
@@ -7219,6 +7339,7 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
                     offset=(page_number - 1) * get_directory_page_size(),
                     limit=get_directory_page_size(),
                     include_total=(page_number == 1),
+                    group=group,
                 )
             )
 
@@ -7247,6 +7368,7 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
         all_items = client.catalog(
             library_id,
             limit=200,
+            group=group,
         )
         grouped_items = [
             item
@@ -7272,6 +7394,7 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
         action="library_letter",
         page=page_number,
         letter=letter,
+        box_sets_enabled=box_sets_enabled,
     )
 
     detail_map = fetch_detail_metadata(
@@ -7328,6 +7451,20 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
                 resume_available=int(has_usable_resume(display_progress)),
             )
             batch.append((url, list_item, False))
+        elif media_type == "box_set":
+            box_set_id = get_box_set_id(catalog_item)
+            box_set_data = catalog_item.get("box_set") or {}
+            box_set_library_id = box_set_data.get("library_id") or library_id
+            if not box_set_id:
+                log("Skipping Box Set card without a collection ID", xbmc.LOGWARNING)
+                continue
+            list_item.setProperty("Silo.BoxSetID", str(box_set_id))
+            url = build_url(
+                action="box_set",
+                box_set_id=box_set_id,
+                library_id=box_set_library_id,
+            )
+            batch.append((url, list_item, True))
         else:
             url = build_url(
                 action="seasons",
@@ -7362,12 +7499,66 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
                 letter=letter,
                 page=page_number + 1,
                 expected_count=expected_count,
+                box_sets_enabled=int(box_sets_enabled),
             ),
             next_item,
             True,
         )
 
     xbmcplugin.endOfDirectory(HANDLE)
+
+def list_box_set(client, box_set_id, library_id):
+    """Display the movies in one TMDB Box Set using the normal Kodi pipeline."""
+    box_set_id = str(box_set_id or "").strip()
+    library_id = str(library_id or "").strip()
+    if not box_set_id or not library_id:
+        raise SiloError("A Box Set ID and library ID are required.")
+
+    data = client.box_set(box_set_id, library_id) or {}
+    items = data.get("items") or []
+    xbmcplugin.setPluginCategory(HANDLE, data.get("title") or "Box Set")
+    xbmcplugin.setContent(HANDLE, "movies")
+
+    detail_map = fetch_detail_metadata(client, items, library_id)
+    progress_map, series_watch_map, season_watch_map = prepare_catalog_watch_state(
+        client, items, detail_map, library_id=library_id
+    )
+    batch = []
+    for catalog_item in items:
+        content_id = get_content_id(catalog_item)
+        if not content_id:
+            continue
+        detail = detail_map.get(str(content_id))
+        display_progress = (
+            progress_map.get(str(content_id))
+            or catalog_progress(detail)
+            or catalog_progress(catalog_item)
+        )
+        list_item, media_type, content_id, _title, display_progress = build_catalog_list_item(
+            client,
+            catalog_item,
+            detail=detail,
+            progress=display_progress,
+            series_rollup=series_watch_map.get(str(content_id)),
+            season_rollup=season_watch_map.get(str(content_id)),
+            accessed_from_parent=True,
+        )
+        if media_type not in PLAYABLE:
+            continue
+        list_item.setProperty("IsPlayable", "true")
+        url = build_url(
+            action="play",
+            content_id=catalog_item.get("play_content_id") or content_id,
+            library_id=library_id,
+            duration_seconds=catalog_item.get("duration_seconds") or "",
+            resume_available=int(has_usable_resume(display_progress)),
+        )
+        batch.append((url, list_item, False))
+
+    if batch:
+        xbmcplugin.addDirectoryItems(HANDLE, batch, totalItems=len(batch))
+    xbmcplugin.endOfDirectory(HANDLE)
+
 
 def list_seasons(client, series_id, library_id, page=None):
     """Display all seasons belonging to a series.
@@ -10141,6 +10332,16 @@ def router(client):
             client,
             params.get("library_id"),
             params.get("cursor"),
+            box_sets_enabled=str(params.get("box_sets_enabled") or "").lower()
+            in ("1", "true", "yes", "on"),
+        )
+        return
+
+    if action == "box_set":
+        list_box_set(
+            client,
+            params.get("box_set_id"),
+            params.get("library_id"),
         )
         return
 
@@ -10151,6 +10352,8 @@ def router(client):
             params.get("letter"),
             params.get("page"),
             params.get("expected_count"),
+            box_sets_enabled=str(params.get("box_sets_enabled") or "").lower()
+            in ("1", "true", "yes", "on"),
         )
         return
 
