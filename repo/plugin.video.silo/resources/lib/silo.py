@@ -28,6 +28,9 @@ Endpoints used by this addon:
     POST /api/v2/profiles/{id}/verify-pin
     GET  /api/v2/user/libraries
     GET  /api/v2/catalog
+    GET  /api/v2/catalog/search/capabilities
+    GET  /api/v2/catalog/box-sets
+    GET  /api/v2/catalog/box-sets/{id}
     GET  /api/v2/catalog/series/{id}/seasons[/{n}/episodes]
     GET  /api/v2/catalog/items/{id}/versions
     GET  /api/v2/progress
@@ -41,6 +44,7 @@ Endpoints used by this addon:
 # Standard library modules used for configuration, UUID generation and URL handling.
 import base64
 import datetime
+from email.utils import parsedate_to_datetime
 import json
 import os
 import re
@@ -414,6 +418,7 @@ class SiloClient:
 
         self.session = requests.Session()
         self._caps = None
+        self._catalog_search_caps = None
         self._last_refresh_status = None
         self._last_refresh_problem = {}
         self._last_refresh_transient = False
@@ -586,6 +591,27 @@ class SiloClient:
             ("\n" + "\n".join(fields)) if fields else "",
         )
 
+    @staticmethod
+    def _retry_after_delay(value, attempt):
+        """Parse Retry-After and cap the delay for a synchronous Kodi request."""
+        delay = None
+        raw = str(value or "").strip()
+        if raw:
+            try:
+                delay = float(raw)
+            except (TypeError, ValueError):
+                try:
+                    retry_at = parsedate_to_datetime(raw)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=datetime.timezone.utc)
+                    delay = retry_at.timestamp() - time.time()
+                except (TypeError, ValueError, OverflowError):
+                    delay = None
+
+        if delay is None or delay <= 0:
+            delay = float(2 ** max(0, int(attempt or 0)))
+        return min(15.0, max(0.25, float(delay)))
+
     # Send an authenticated API request and handle access-token/profile-token retries.
     def _send(self, method, path, params=None, body=None, need_profile=True, retry=True, timeout=30, log_not_found=True, extra_headers=None, stream=False, send_profile=True):
         if not self.base:
@@ -621,22 +647,46 @@ class SiloClient:
         if need_profile and not self.cfg.get("profile_id"):
             self.select_profile()
 
-        try:
-            headers = self._headers(send_profile=send_profile)
-            if extra_headers:
-                headers.update(extra_headers)
+        headers = self._headers(send_profile=send_profile)
+        if extra_headers:
+            headers.update(extra_headers)
 
-            r = self.session.request(
-                method,
-                self.base + path,
-                headers=headers,
-                params=params,
-                json=body,
-                timeout=timeout,
-                stream=stream,
+        # A 429 is replayed only for safe reads. Mutations and playback starts
+        # fail immediately to avoid duplicating a write with an uncertain result.
+        retry_rate_limit = str(method or "").upper() in ("GET", "HEAD", "OPTIONS")
+        rate_limit_attempt = 0
+        while True:
+            try:
+                r = self.session.request(
+                    method,
+                    self.base + path,
+                    headers=headers,
+                    params=params,
+                    json=body,
+                    timeout=timeout,
+                    stream=stream,
+                )
+            except requests.RequestException as e:
+                raise SiloError("Cannot reach server: %s" % e)
+
+            if r.status_code != 429 or not retry_rate_limit or rate_limit_attempt >= 2:
+                break
+
+            delay = self._retry_after_delay(
+                r.headers.get("Retry-After"),
+                rate_limit_attempt,
             )
-        except requests.RequestException as e:
-            raise SiloError("Cannot reach server: %s" % e)
+            log(
+                "Silo rate limited %s %s; retrying safe request in %.2fs (attempt %d/2)"
+                % (method, path, delay, rate_limit_attempt + 1),
+                xbmc.LOGWARNING,
+            )
+            try:
+                r.close()
+            except Exception:
+                pass
+            time.sleep(delay)
+            rate_limit_attempt += 1
 
         # A 401 may mean the access token has expired. Refresh it and retry once.
         if r.status_code == 401 and retry:
@@ -1725,6 +1775,70 @@ class SiloClient:
             data = data["body"]
         return data if isinstance(data, dict) else {}
 
+    def catalog_search_capabilities(self):
+        """Read optional catalog features supported by this server."""
+        if self._catalog_search_caps is not None:
+            return self._catalog_search_caps
+
+        try:
+            data = self._json(
+                "GET",
+                "/api/v2/catalog/search/capabilities",
+            ) or {}
+        except SiloError as exc:
+            if exc.status in (404, 501):
+                log(
+                    "Catalog search capabilities are unavailable on this server: %s" % exc,
+                    xbmc.LOGDEBUG,
+                )
+                self._catalog_search_caps = {}
+                return self._catalog_search_caps
+            raise
+
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        self._catalog_search_caps = data if isinstance(data, dict) else {}
+        return self._catalog_search_caps
+
+    def search_box_sets(self, query, limit=5):
+        """Search viewer-visible TMDB Box Sets when the server advertises support."""
+        query = str(query or "").strip()
+        if not query or self.catalog_search_capabilities().get("box_sets") is not True:
+            return []
+
+        try:
+            limit = max(1, min(int(limit or 5), 20))
+        except (TypeError, ValueError):
+            limit = 5
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/box-sets",
+            params={"q": query, "limit": limit},
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        if not isinstance(data, dict):
+            return []
+        items = data.get("items") or []
+        return items if isinstance(items, list) else []
+
+    def box_set(self, collection_id, library_id):
+        """Retrieve one TMDB Box Set and its accessible movies in release order."""
+        collection_id = str(collection_id or "").strip()
+        library_id = str(library_id or "").strip()
+        if not collection_id or not library_id:
+            raise SiloError("A Box Set ID and library ID are required.")
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/box-sets/%s" % quote(collection_id, safe=""),
+            params={"library_id": library_id, "image_size": "medium"},
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
     # Search the profile-visible catalog across all accessible libraries.
     # Silo performs the search server-side, so the addon does not need to
     # download and scan every library itself.
@@ -1955,7 +2069,7 @@ class SiloClient:
     # Silo's current API documents a maximum catalog page size of 200, so use
     # that maximum to reduce the number of HTTP round trips for large libraries.
     def catalog_page(self, library_id, cursor=None, limit=200,
-                     name_prefix=None, sort=None, seek=None):
+                     name_prefix=None, sort=None, seek=None, group=None):
         """Return one Silo catalog page and its continuation cursor."""
         limit = max(1, min(int(limit or 200), 200))
 
@@ -1965,6 +2079,9 @@ class SiloClient:
             "skip_total": "true",
             "image_size": "medium",
         }
+        if group == "box_set":
+            params["source"] = "query"
+            params["group"] = "box_set"
 
         if name_prefix:
             params["name_prefix"] = str(name_prefix)
@@ -1991,7 +2108,7 @@ class SiloClient:
 
     # Return one server-side alphabet page and its total/has-more information.
     def catalog_prefix_page(self, library_id, name_prefix, offset=0,
-                            limit=200, include_total=False):
+                            limit=200, include_total=False, group=None):
         """Return one indexed title-prefix page using Silo's seek support."""
         prefix = str(name_prefix or "").strip()
         if not prefix:
@@ -2004,18 +2121,23 @@ class SiloClient:
 
         limit = max(1, min(int(limit or 200), 200))
 
+        params = {
+            "library_id": library_id,
+            "limit": limit,
+            "skip_total": "false" if include_total else "true",
+            "image_size": "medium",
+            "name_prefix": prefix,
+            "sort": "title",
+            "seek": offset,
+        }
+        if group == "box_set":
+            params["source"] = "query"
+            params["group"] = "box_set"
+
         data = self._json(
             "GET",
             "/api/v2/catalog",
-            params={
-                "library_id": library_id,
-                "limit": limit,
-                "skip_total": "false" if include_total else "true",
-                "image_size": "medium",
-                "name_prefix": prefix,
-                "sort": "title",
-                "seek": offset,
-            },
+            params=params,
         ) or {}
 
         try:
@@ -2034,7 +2156,7 @@ class SiloClient:
         )
 
 
-    def catalog(self, library_id, limit=200):
+    def catalog(self, library_id, limit=200, group=None):
         items = []
         cursor = None
 
@@ -2043,6 +2165,7 @@ class SiloClient:
                 library_id,
                 cursor=cursor,
                 limit=limit,
+                group=group,
             )
 
             items.extend(page_items)
@@ -2519,10 +2642,21 @@ class SiloClient:
             hls_delivery["enabled"] = False
             hls_delivery["supported_on_device"] = False
 
+        supported_features = set(caps.get("features") or [])
+        client_features = ["playback_plan_v3", "seek_reanchor_v1"]
+        # Kodi's native player can consume the HLS SUBTITLES group. Add the
+        # optional rendition features only when this server advertises them.
+        if "hls_subtitle_renditions_v1" in supported_features:
+            client_features.append("hls_subtitle_renditions_v1")
+            if "hls_remux_subtitle_renditions_v1" in supported_features:
+                client_features.append("hls_remux_subtitle_renditions_v1")
+            if "hls_subtitle_renditions_all_v1" in supported_features:
+                client_features.append("hls_subtitle_renditions_all_v1")
+
         body = {
             "installation_id": self._installation_id(),
             "protocol_version": pv,
-            "client_features": ["playback_plan_v3", "seek_reanchor_v1"],
+            "client_features": client_features,
             "file_id": str(file_id),
             "profile_id": str(self.cfg["profile_id"]),
             "start_position": float(start_position),
@@ -2647,7 +2781,9 @@ class SiloClient:
         body = {
             "installation_id": self._installation_id(),
             "protocol_version": 3,
-            "client_features": ["playback_plan_v3"],
+            "client_features": list(
+                (info or {}).get("client_features") or ["playback_plan_v3", "seek_reanchor_v1"]
+            ),
             "operation": str(operation or "failure_recovery"),
             "playback_attempt_id": playback_attempt_id,
             "replan_request_id": uuid.uuid4().hex,
@@ -2718,6 +2854,7 @@ class SiloClient:
             "session_id": data.get("session_id") or session_id,
             "playback_plan": new_plan,
             "playback_attempt_id": playback_attempt_id,
+            "client_features": body.get("client_features") or [],
             "quality_preference": quality_preference,
             "plan_attempt_id": plan_attempt_id,
             "attempted_plan_keys": attempted_plan_keys,
@@ -2756,7 +2893,9 @@ class SiloClient:
         body = {
             "installation_id": self._installation_id(),
             "protocol_version": 3,
-            "client_features": (info or {}).get("client_features") or ["playback_plan_v3"],
+            "client_features": list(
+                (info or {}).get("client_features") or ["playback_plan_v3", "seek_reanchor_v1"]
+            ),
             "operation": "seek_reanchor",
             "playback_attempt_id": playback_attempt_id,
             "replan_request_id": str(uuid.uuid4()),
