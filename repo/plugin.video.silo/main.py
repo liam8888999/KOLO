@@ -7320,10 +7320,12 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
     server_prefix_validated = False
     server_has_more = False
 
-    # Silo's name_prefix is indexed and exactly matches the normal title sort
-    # key.  The add-on's old grouping ignores leading punctuation, so validate
-    # page 1 against the exact count from our alphabet index before trusting it.
-    if len(letter) == 1 and letter.isalpha():
+    # For ordinary catalog cards, Silo's indexed prefix follows the same
+    # title key the Kodi alphabet folders display. Box Set cards are different:
+    # the server indexes their representative movie, while Kodi groups the
+    # visible Box Set title. Use the local grouped-list path for Box Sets so
+    # pages remain consistent with the displayed letter and its item count.
+    if not group and len(letter) == 1 and letter.isalpha():
         try:
             expected = int(expected_count)
         except (TypeError, ValueError):
