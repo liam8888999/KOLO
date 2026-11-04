@@ -7291,11 +7291,42 @@ def build_library_box_set_items(client, items, library_id):
             )
             continue
 
+        # ItemBoxSet returns the BoxSetDetailView as a flat object
+        # (CollectionID/LibraryID plus Items), not a nested "box_set" card.
         box_set = response.get("box_set")
-        if not isinstance(box_set, dict) or not box_set.get("id"):
+        if not isinstance(box_set, dict):
+            box_set = response
+        if not isinstance(box_set, dict):
             continue
 
-        card = box_set_search_catalog_item(box_set)
+        collection_id = (
+            box_set.get("id")
+            or box_set.get("collection_id")
+            or box_set.get("CollectionID")
+        )
+        if not collection_id:
+            continue
+
+        normalized_box_set = {
+            "id": collection_id,
+            "library_id": (
+                box_set.get("library_id")
+                or box_set.get("LibraryID")
+                or library_id
+            ),
+            "title": box_set.get("title") or box_set.get("Title") or "Box Set",
+            "overview": box_set.get("overview") or box_set.get("Overview") or "",
+            "poster_url": box_set.get("poster_url") or box_set.get("PosterURL") or "",
+            "poster_thumbhash": box_set.get("poster_thumbhash") or box_set.get("PosterThumbhash") or "",
+            "backdrop_url": box_set.get("backdrop_url") or box_set.get("BackdropURL") or "",
+            "backdrop_thumbhash": box_set.get("backdrop_thumbhash") or box_set.get("BackdropThumbhash") or "",
+            "movie_count": box_set.get("movie_count") or box_set.get("member_count") or box_set.get("MemberCount") or 0,
+            "played_count": box_set.get("played_count") or box_set.get("PlayedCount") or 0,
+            "first_year": box_set.get("first_year") or box_set.get("FirstYear") or 0,
+            "last_year": box_set.get("last_year") or box_set.get("LastYear") or 0,
+            "items": box_set.get("items") or box_set.get("Items") or [],
+        }
+        card = box_set_search_catalog_item(normalized_box_set)
         if not card:
             continue
         collection_id = get_box_set_id(card)
@@ -7303,7 +7334,7 @@ def build_library_box_set_items(client, items, library_id):
             continue
         box_sets[collection_id] = card
 
-        members = box_set.get("items") or []
+        members = normalized_box_set.get("items") or []
         if isinstance(members, list):
             for member in members:
                 member_id = get_content_id(member) if isinstance(member, dict) else None
