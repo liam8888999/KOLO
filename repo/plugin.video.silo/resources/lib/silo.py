@@ -1823,6 +1823,22 @@ class SiloClient:
         items = data.get("items") or []
         return items if isinstance(items, list) else []
 
+    def item_box_set(self, content_id, library_id):
+        """Retrieve the box set associated with one movie, if it has one."""
+        content_id = str(content_id or "").strip()
+        library_id = str(library_id or "").strip()
+        if not content_id or not library_id:
+            raise SiloError("A content ID and library ID are required.")
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/items/%s/box-set" % quote(content_id, safe=""),
+            params={"library_id": library_id, "image_size": "medium"},
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
     def box_set(self, collection_id, library_id):
         """Retrieve one TMDB Box Set and its accessible movies in release order."""
         collection_id = str(collection_id or "").strip()
