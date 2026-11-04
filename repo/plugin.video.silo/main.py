@@ -7255,6 +7255,78 @@ def _render_catalog_items(client, data, section_title=None, merged_group_key=Non
 
 
 
+def library_box_sets_enabled():
+    """Whether to combine TMDB collections into virtual library cards."""
+    return ADDON.getSetting("library_box_sets") != "false"
+
+
+def build_library_box_set_items(client, items, library_id):
+    """Replace member movies with virtual box-set cards for library browsing.
+
+    Membership is deliberately resolved live on every browse; no local cache
+    is written because the server remains authoritative for collection data.
+    """
+    if not library_box_sets_enabled():
+        return items
+
+    movies = []
+    for item in items:
+        media_type = str(item.get("type") or item.get("media_type") or "").lower()
+        if media_type in ("movie", "film"):
+            movies.append(item)
+
+    box_sets = {}
+    member_ids = set()
+    for movie in movies:
+        content_id = get_content_id(movie)
+        if not content_id or str(content_id) in member_ids:
+            continue
+        try:
+            response = client.item_box_set(content_id, library_id) or {}
+        except SiloError as exc:
+            log(
+                "Unable to resolve box-set membership for %s: %s"
+                % (content_id, exc),
+                xbmc.LOGDEBUG,
+            )
+            continue
+
+        box_set = response.get("box_set")
+        if not isinstance(box_set, dict) or not box_set.get("id"):
+            continue
+
+        card = box_set_search_catalog_item(box_set)
+        if not card:
+            continue
+        collection_id = get_box_set_id(card)
+        if not collection_id:
+            continue
+        box_sets[collection_id] = card
+
+        members = box_set.get("items") or []
+        if isinstance(members, list):
+            for member in members:
+                member_id = get_content_id(member) if isinstance(member, dict) else None
+                if member_id:
+                    member_ids.add(str(member_id))
+        member_ids.add(str(content_id))
+
+    # Keep non-movie items untouched, omit member movies, and add one card
+    # for each distinct collection. Sort the result by its displayed title.
+    output = [
+        item for item in items
+        if str(get_content_id(item) or "") not in member_ids
+        or str(item.get("type") or item.get("media_type") or "").lower()
+        not in ("movie", "film")
+    ]
+    output.extend(box_sets.values())
+    output.sort(key=lambda item: (
+        _library_group_title(item).casefold(),
+        str(get_content_id(item) or ""),
+    ))
+    return output
+
+
 def list_library(client, library_id, cursor=None):
     """Display the compact A-Z index for one Silo library."""
     if not library_id:
@@ -7263,6 +7335,7 @@ def list_library(client, library_id, cursor=None):
     # Library browse follows Silo's catalogue contract: movies remain
     # individual items; box sets are not a catalogue grouping.
     items = client.catalog(library_id, limit=200)
+    items = build_library_box_set_items(client, items, library_id)
 
     counts = library_letter_counts(items)
 
@@ -7313,8 +7386,10 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
     server_prefix_validated = False
     server_has_more = False
 
-    # Use Silo's indexed title-prefix query for ordinary catalogue cards.
-    if len(letter) == 1 and letter.isalpha():
+    # Virtual box-set cards are built client-side, so use the complete
+    # catalogue rather than the server's ungrouped prefix index.
+    use_virtual_box_sets = library_box_sets_enabled()
+    if not use_virtual_box_sets and len(letter) == 1 and letter.isalpha():
         try:
             expected = int(expected_count)
         except (TypeError, ValueError):
@@ -7357,6 +7432,7 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
             library_id,
             limit=200,
         )
+        all_items = build_library_box_set_items(client, all_items, library_id)
         grouped_items = [
             item
             for item in all_items
