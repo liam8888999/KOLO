@@ -2371,7 +2371,7 @@ def set_watch_state(list_item, progress, content_type=None):
 
 def get_content_id(item):
     """Return a Silo catalog item's content ID."""
-    return item.get("content_id") or item.get("id")
+    return item.get("content_id") or item.get("ContentID") or item.get("id")
 
 
 def get_box_set_id(item):
@@ -7363,8 +7363,8 @@ def list_library(client, library_id, cursor=None):
     if not library_id:
         raise SiloError("No library ID was supplied.")
 
-    # Library browse follows Silo's catalogue contract: movies remain
-    # individual items; box sets are not a catalogue grouping.
+    # Silo's catalogue stays ungrouped; optional virtual Box Sets are
+    # composed here from the per-movie membership endpoint.
     items = client.catalog(library_id, limit=200)
     items = build_library_box_set_items(client, items, library_id)
 
