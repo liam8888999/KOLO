@@ -7285,11 +7285,11 @@ def build_library_box_set_items(client, items, library_id):
 
     # Each worker uses its own requests.Session. Collection membership calls
     # run in parallel rather than serially holding up the Kodi directory.
-    worker_count = min(8, len(movie_ids))
-    chunks = [
-        movie_ids[index::worker_count]
-        for index in range(worker_count)
-    ]
+    # The directory page is capped at 200 items, so this opens one
+    # membership lookup per movie on this page at the same time. There is no
+    # bulk ItemBoxSet endpoint in the current Silo API.
+    worker_count = len(movie_ids)
+    chunks = [[content_id] for content_id in movie_ids]
 
     def fetch_chunk(chunk):
         worker_client = SiloClient()
