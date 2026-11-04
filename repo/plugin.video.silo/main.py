@@ -397,7 +397,7 @@ def paginate_directory(items, page):
 
 
 def add_previous_page(library_id=None, series_id=None, season_number=None,
-                      action=None, page=1, letter=None, box_sets_enabled=None):
+                      action=None, page=1, letter=None):
     """Add a Previous Page folder when the current directory is past page 1."""
     try:
         page_number = int(page or 1)
@@ -420,9 +420,6 @@ def add_previous_page(library_id=None, series_id=None, season_number=None,
         params["season_number"] = season_number
     if letter:
         params["letter"] = letter
-    if box_sets_enabled is not None:
-        params["box_sets_enabled"] = int(bool(box_sets_enabled))
-
     item = xbmcgui.ListItem(label="Previous Page")
     _directory_art(item, "folder-page")
     xbmcplugin.addDirectoryItem(
@@ -6998,7 +6995,6 @@ def list_libraries(client):
                 build_url(
                     action="library",
                     library_id=library_id,
-                    box_sets_enabled=int(library.get("box_sets_enabled") is True),
                 ),
                 item,
                 True,
@@ -7259,14 +7255,14 @@ def _render_catalog_items(client, data, section_title=None, merged_group_key=Non
 
 
 
-def list_library(client, library_id, cursor=None, box_sets_enabled=False):
+def list_library(client, library_id, cursor=None):
     """Display the compact A-Z index for one Silo library."""
     if not library_id:
         raise SiloError("No library ID was supplied.")
 
-    group = "box_set" if box_sets_enabled else None
-    # Count the same grouped list the user will browse below.
-    items = client.catalog(library_id, limit=200, group=group)
+    # Library browse follows Silo's catalogue contract: movies remain
+    # individual items; box sets are not a catalogue grouping.
+    items = client.catalog(library_id, limit=200)
 
     counts = library_letter_counts(items)
 
@@ -7292,7 +7288,6 @@ def list_library(client, library_id, cursor=None, box_sets_enabled=False):
                 letter=group,
                 page=1,
                 expected_count=count,
-                box_sets_enabled=int(box_sets_enabled),
             ),
             item,
             True,
@@ -7300,8 +7295,7 @@ def list_library(client, library_id, cursor=None, box_sets_enabled=False):
 
     xbmcplugin.endOfDirectory(HANDLE)
 
-def list_library_letter(client, library_id, letter, page=None, expected_count=None,
-                        box_sets_enabled=False):
+def list_library_letter(client, library_id, letter, page=None, expected_count=None):
     """Display one alphabet group using Silo's indexed prefix query when safe."""
     if not library_id:
         raise SiloError("No library ID was supplied.")
@@ -7315,17 +7309,12 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
     except (TypeError, ValueError):
         page_number = 1
 
-    group = "box_set" if box_sets_enabled else None
     grouped_items = None
     server_prefix_validated = False
     server_has_more = False
 
-    # For ordinary catalog cards, Silo's indexed prefix follows the same
-    # title key the Kodi alphabet folders display. Box Set cards are different:
-    # the server indexes their representative movie, while Kodi groups the
-    # visible Box Set title. Use the local grouped-list path for Box Sets so
-    # pages remain consistent with the displayed letter and its item count.
-    if not group and len(letter) == 1 and letter.isalpha():
+    # Use Silo's indexed title-prefix query for ordinary catalogue cards.
+    if len(letter) == 1 and letter.isalpha():
         try:
             expected = int(expected_count)
         except (TypeError, ValueError):
@@ -7339,7 +7328,6 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
                     offset=(page_number - 1) * get_directory_page_size(),
                     limit=get_directory_page_size(),
                     include_total=(page_number == 1),
-                    group=group,
                 )
             )
 
@@ -7368,7 +7356,6 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
         all_items = client.catalog(
             library_id,
             limit=200,
-            group=group,
         )
         grouped_items = [
             item
@@ -7394,7 +7381,6 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
         action="library_letter",
         page=page_number,
         letter=letter,
-        box_sets_enabled=box_sets_enabled,
     )
 
     detail_map = fetch_detail_metadata(
@@ -7499,7 +7485,6 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
                 letter=letter,
                 page=page_number + 1,
                 expected_count=expected_count,
-                box_sets_enabled=int(box_sets_enabled),
             ),
             next_item,
             True,
@@ -10332,8 +10317,6 @@ def router(client):
             client,
             params.get("library_id"),
             params.get("cursor"),
-            box_sets_enabled=str(params.get("box_sets_enabled") or "").lower()
-            in ("1", "true", "yes", "on"),
         )
         return
 
@@ -10352,8 +10335,6 @@ def router(client):
             params.get("letter"),
             params.get("page"),
             params.get("expected_count"),
-            box_sets_enabled=str(params.get("box_sets_enabled") or "").lower()
-            in ("1", "true", "yes", "on"),
         )
         return
 
