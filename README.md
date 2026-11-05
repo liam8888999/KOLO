@@ -1,10 +1,12 @@
-# KOLO - A KODI CLIENT FOR SILO MEDIA SERVER
+# Kolo
 
-A community-developed Kodi client compatible with [Silo Server](https://github.com/Silo-Server/silo-server).
+A community-developed Kodi client for [Silo Media Server](https://github.com/Silo-Server/silo-server).
 
 <p align="center"><img src="kolo.webp" alt="Kolo logo" width="500"></p>
 
 **Independent community project:** this add-on is not affiliated with, endorsed by, sponsored by, or an official product of Silo Media L.L.C. or the Kodi Foundation. **No media, streams, or subscriptions are included or supplied.** You must configure access to your own Silo Server and provide your own media access.
+
+**Upgrading from the previous add-on?** Kolo uses a new add-on ID (`plugin.video.kolo`), so Kodi will not update an older install automatically. Install the Kolo repository (see below), install Kolo, sign in again, then remove the old add-on.
 
 ---
 
@@ -18,7 +20,7 @@ https://discord.gg/dyae2tv7Qs
 
 ## Kodi Repository Address
 
-https://liam8888999.github.io/silo-kodi/
+https://liam8888999.github.io/KOLO/
 
 ---
 
@@ -149,7 +151,7 @@ https://github.com/Silo-Server/silo-server
 
 # 🚀 Installation
 
-The Silo repository can be installed directly from Kodi without manually downloading the repository ZIP.
+The Kolo repository can be installed directly from Kodi without manually downloading the repository ZIP.
 
 ## 1. Enable Unknown Sources
 
@@ -170,7 +172,7 @@ You only need to do this once.
 
 ---
 
-## 2. Add the Silo Repository to Kodi's File Manager
+## 2. Add the Kolo Repository to Kodi's File Manager
 
 Open:
 
@@ -188,13 +190,13 @@ Add source
 Enter the following address:
 
 ```text
-https://liam8888999.github.io/silo-kodi/
+https://liam8888999.github.io/KOLO/
 ```
 
 For the name, enter:
 
 ```text
-Silo Repository
+Kolo Repository
 ```
 
 Then select **OK**.
@@ -202,7 +204,7 @@ Then select **OK**.
 You should now have a file source called:
 
 ```text
-Silo Repository
+Kolo Repository
 ```
 
 in Kodi's File Manager.
@@ -222,7 +224,7 @@ Add-ons
 Select:
 
 ```text
-Silo Repository
+Kolo Repository
 ```
 
 You should see the repository ZIP file.
@@ -230,16 +232,16 @@ You should see the repository ZIP file.
 Select the ZIP file, for example:
 
 ```text
-repository.silo-kodi-1.0.2.zip
+repository.kolo-1.0.zip
 ```
 
-Kodi will install the **Silo Kodi Repository** directly from the hosted repository.
+Kodi will install the **Kolo Repository** directly from the hosted repository.
 
 > **You do not need to download or extract the ZIP file manually.**
 
 ---
 
-## 4. Install the Silo Add-on
+## 4. Install the Kolo Add-on
 
 Once the repository has been installed, go to:
 
@@ -252,22 +254,22 @@ Add-ons
 Select:
 
 ```text
-Silo Kodi Repository
+Kolo Repository
 ```
 
-Then select the **Silo** add-on and choose:
+Then select the **Kolo** add-on and choose:
 
 ```text
 Install
 ```
 
-Kodi will install the Silo add-on and any required dependencies.
+Kodi will install the Kolo add-on and any required dependencies.
 
 ---
 
 # ⚙️ Configuration
 
-After installing the add-on, open the Silo and login. 
+After installing the add-on, open Kolo and sign in to your Silo Server.
 
 First it will ask for your server address
 
@@ -301,9 +303,9 @@ Follow the sign-in prompts. Depending on the server, you can sign in with a devi
 
 ---
 
-# 🎬 Using Silo
+# 🎬 Using Kolo
 
-Once configured, open **Silo** from Kodi's add-ons.
+Once configured, open **Kolo** from Kodi's add-ons.
 
 The add-on communicates with your Silo Server and displays the media available through it.
 
@@ -315,7 +317,7 @@ The basic architecture is:
                     ┌─────────────────┐
                     │      Kodi       │
                     │                 │
-                    │   Silo Add-on   │
+                    │   Kolo Add-on   │
                     └────────┬────────┘
                              │
                              │ API
@@ -338,14 +340,14 @@ Kodi provides the interface and playback, while Silo provides access to the medi
 
 # 🔄 Updates
 
-The Silo add-on is distributed through a Kodi repository, allowing new versions to be delivered through Kodi without manually reinstalling the add-on.
+The Kolo add-on is distributed through a Kodi repository, allowing new versions to be delivered through Kodi without manually reinstalling the add-on.
 
 To manually check for updates:
 
 ```text
 Add-ons
   → My add-ons
-  → Silo
+  → Kolo
   → Check for updates
 ```
 
@@ -353,7 +355,7 @@ If automatic add-on updates are enabled in Kodi, updates may be installed automa
 
 The repository is hosted at:
 
-https://liam8888999.github.io/silo-kodi/
+https://liam8888999.github.io/KOLO/
 
 ---
 
@@ -364,13 +366,13 @@ https://liam8888999.github.io/silo-kodi/
 Make sure the File Manager source was added correctly:
 
 ```text
-https://liam8888999.github.io/silo-kodi/
+https://liam8888999.github.io/KOLO/
 ```
 
 The source should be named:
 
 ```text
-Silo Repository
+Kolo Repository
 ```
 
 Then check:
@@ -379,18 +381,18 @@ Then check:
 Add-ons
   → Add-on browser
   → Install from zip file
-  → Silo Repository
+  → Kolo Repository
 ```
 
 The repository ZIP should be visible there.
 
 ---
 
-## Silo does not appear in the repository
+## Kolo does not appear in the repository
 
 Check that:
 
-1. The Silo repository installed successfully.
+1. The Kolo repository installed successfully.
 2. You selected **Install from repository** after installing it.
 3. Kodi has network access.
 4. The repository ZIP is the current version.
@@ -442,16 +444,16 @@ Sometimes if connection to your library is a bit slow it can take kodi longer to
 
 # 🧑‍💻 Development
 
-The Silo Kodi add-on is contained in:
+The Kolo add-on is contained in:
 
 ```text
-plugin.video.silo/
+plugin.video.kolo/
 ```
 
 A typical add-on structure is:
 
 ```text
-plugin.video.silo/
+plugin.video.kolo/
 ├── addon.xml
 ├── addon.py
 └── ...
@@ -465,11 +467,11 @@ The repository contains the metadata required for Kodi to discover and install t
 
 The repository is hosted using GitHub Pages:
 
-**https://liam8888999.github.io/silo-kodi/**
+**https://liam8888999.github.io/KOLO/**
 
 Kodi uses the repository to:
 
-* Discover the Silo add-on
+* Discover the Kolo add-on
 * Determine the available version
 * Download the add-on
 * Download required dependencies
@@ -486,7 +488,7 @@ When reporting a problem, include as much useful information as possible:
 * Kodi version
 * Operating system
 * Silo Server version
-* Silo add-on version
+* Kolo add-on version
 * Description of the problem
 * Relevant Kodi log output
 
@@ -506,6 +508,6 @@ https://github.com/Silo-Server/silo-server
 
 ## ⭐ Support the Project
 
-If you find the Silo Kodi add-on useful, consider giving the project a ⭐ on GitHub.
+If you find the Kolo add-on useful, consider giving the project a ⭐ on GitHub.
 
 Bug reports, feature requests and contributions are welcome.

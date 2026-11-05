@@ -1,0 +1,3142 @@
+"""Silo /api/v2 client for Kodi.
+
+This module is responsible for communicating with the Silo Server API.
+Kodi UI/playback decisions live in main.py so the two responsibilities stay
+separate and the code remains easier to maintain.
+
+Important playback behaviour:
+    * Silo is the source of truth for resume position.
+    * main.py performs a fresh progress lookup immediately before playback.
+    * The selected resume position is sent to POST /api/v2/playback/start as
+      start_position so Kodi does not have to perform a second seek.
+    * Kodi -> Silo progress is reported throughout playback.
+
+Pagination is deliberately handled inside this client. Kodi never receives
+or displays a "Next Page" item. The catalog and progress requests use the
+maximum page size documented by the current Silo API where supported, reducing
+the number of HTTP round trips for large libraries.
+
+Endpoints used by this addon:
+    POST /api/v2/auth/login
+    POST /api/v2/auth/refresh
+    GET  /api/v2/auth/providers
+    GET  /api/v2/auth/device/capability
+    POST /api/v2/auth/device/start
+    POST /api/v2/auth/device/poll
+    POST /api/v2/auth/device/cancel
+    GET  /api/v2/profiles
+    POST /api/v2/profiles/{id}/verify-pin
+    GET  /api/v2/user/libraries
+    GET  /api/v2/catalog
+    GET  /api/v2/catalog/search/capabilities
+    GET  /api/v2/catalog/box-sets
+    GET  /api/v2/catalog/box-sets/{id}
+    GET  /api/v2/catalog/series/{id}/seasons[/{n}/episodes]
+    GET  /api/v2/catalog/items/{id}/versions
+    GET  /api/v2/progress
+    GET  /api/v2/playback/capabilities
+    POST /api/v2/playback/start
+    POST /api/v2/playback/{sid}/replan
+    POST /api/v2/playback/{sid}/progress
+    DELETE /api/v2/playback/{sid}
+"""
+
+# Standard library modules used for configuration, UUID generation and URL handling.
+import base64
+import datetime
+from email.utils import parsedate_to_datetime
+import json
+import os
+import re
+import uuid
+import threading
+import time
+from urllib.parse import quote, urlsplit
+
+# requests is used for all API communication made by the addon itself.
+import requests
+import xbmc
+import xbmcaddon
+import xbmcgui
+import xbmcvfs
+
+
+# Read addon metadata and determine where Kodi should store persistent configuration.
+ADDON = xbmcaddon.Addon()
+ADDON_VERSION = ADDON.getAddonInfo("version")
+
+# Refresh slightly before JWT expiry so normal API calls do not hit an expired
+# access token first. The server remains authoritative and the 401 path below
+# is still kept as a final fallback for opaque tokens or clock differences.
+ACCESS_TOKEN_REFRESH_MARGIN = 60
+
+# Silo rotates refresh tokens on successful exchanges, so serialize refreshes
+# across SiloClient instances in this Kodi process.
+_REFRESH_LOCK = threading.Lock()
+
+# How the saved account signed in, kept in the hidden auth_method setting so a
+# later forced re-login uses the same method instead of asking for a password
+# the account may not have.
+AUTH_METHOD_PASSWORD = "password"
+AUTH_METHOD_DEVICE = "device"
+
+
+# Central logging helper so every log line identifies this addon.
+def log(msg, level=xbmc.LOGINFO):
+    xbmc.log("[plugin.video.kolo] %s" % msg, level)
+
+
+def _kodi_output_hdr_details():
+    """Return HDR formats Kodi reports for the active display, or None if unknown.
+
+    System.SupportedHDRTypes describes the display's supported HDR formats. Do
+    not infer output support from a generic HDR decoder flag: the server uses
+    these details to decide whether a source-preserving remux is appropriate.
+    Kodi does not expose Dolby Vision profile/level support through this label,
+    so this helper deliberately never invents Dolby Vision profile claims.
+    """
+    try:
+        raw = str(xbmc.getInfoLabel("System.SupportedHDRTypes") or "").strip().lower()
+    except Exception:
+        raw = ""
+
+    if not raw:
+        log(
+            "Kodi did not report supported display HDR types; output HDR capability is unknown.",
+            xbmc.LOGDEBUG,
+        )
+        return None
+
+    compact = re.sub(r"[^a-z0-9+]", "", raw)
+    hdr10_plus = bool(re.search(r"hdr\s*10\s*(?:\+|plus)", raw)) or "hdr10plus" in compact
+    hdr10 = hdr10_plus or bool(re.search(r"hdr\s*10(?!\s*(?:\+|plus))", raw))
+    hlg = "hlg" in compact or "hybridloggamma" in compact
+    dolby_vision = (
+        "dolbyvision" in compact
+        or bool(re.search(r"\bdv\b", raw))
+    )
+
+    # Dolby Vision presence alone is insufficient for the server's
+    # profile-specific output contract; do not treat it as a complete report.
+    if not any((hdr10, hdr10_plus, hlg)):
+        log(
+            "Kodi did not report any recognized display HDR types; output HDR capability is unknown.",
+            xbmc.LOGDEBUG,
+        )
+        return None
+
+    details = {
+        "hdr10": hdr10,
+        "hdr10_plus": hdr10_plus,
+        "hlg": hlg,
+        # The system label only reports that Dolby Vision is supported, not
+        # which profiles/levels the active display accepts. Keep this empty so
+        # the server does not overclaim Profile 5/7/8 compatibility.
+        "dolby_vision_profiles": [],
+    }
+    log(
+        "Kodi display HDR types: HDR10=%s HDR10+=%s HLG=%s DolbyVision=%s"
+        % (hdr10, hdr10_plus, hlg, dolby_vision),
+        xbmc.LOGDEBUG,
+    )
+    return details
+
+
+# Window property used to keep the login loading indicator visible while the
+# refreshed root directory is loading after a successful login.
+_LOGIN_LOADING_PROPERTY = "Kolo.LoginLoading"
+
+
+def _show_login_loading():
+    """Show Kodi's native non-cancelable busy spinner once for the login flow."""
+    window = xbmcgui.Window(10000)
+
+    # The login flow can pass through automatic profile selection, an explicit
+    # profile chooser, and a post-login Container.Refresh. Keep one continuous
+    # spinner instead of activating the busy dialog more than once.
+    if window.getProperty(_LOGIN_LOADING_PROPERTY) == "true":
+        return
+
+    window.setProperty(_LOGIN_LOADING_PROPERTY, "true")
+
+    # DialogBusy was removed as a usable Python class in Kodi 18+. The
+    # supported workaround is to activate the non-cancelable busy-dialog
+    # window explicitly.
+    xbmc.executebuiltin("ActivateWindow(busydialognocancel)")
+
+    # Allow Kodi's GUI thread to process and display the dialog before the
+    # synchronous network request immediately following this call starts.
+    xbmc.sleep(100)
+
+
+def _hide_login_loading():
+    """Close the login busy spinner and clear its refresh-state marker."""
+    xbmc.executebuiltin("Dialog.Close(busydialognocancel)")
+    xbmc.sleep(50)
+    xbmcgui.Window(10000).clearProperty(_LOGIN_LOADING_PROPERTY)
+
+
+# Load saved server/login/device/profile settings from Kodi's addon profile.
+# Kodi's add-on settings are the persistent configuration store.
+# The cfg dictionary remains an in-memory convenience for the rest of the
+# client; it is never persisted to config.json.
+_INTERNAL_SETTINGS = (
+    "device_id",
+    "token",
+    "refresh_token",
+    "profile_id",
+    "profile_token",
+    "bandwidth_estimate_cache",
+)
+
+
+def _setting(key, default=""):
+    value = ADDON.getSetting(key)
+    return value if value not in (None, "") else default
+
+
+def _set_setting(key, value):
+    ADDON.setSetting(key, "" if value is None else str(value))
+
+
+def _parse_server_time(value):
+    """Return a Silo UTC timestamp such as 2026-01-01T00:00:00.000Z as epoch seconds."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+def _clear_account_settings():
+    """Clear editable login/profile settings and authentication state."""
+    for key in (
+        "server",
+        "username",
+        "auth_method",
+        "device_id",
+        "token",
+        "refresh_token",
+        "profile_id",
+        "profile_token",
+        "bandwidth_estimate_cache",
+        "start_overrides",
+    ):
+        _set_setting(key, "")
+
+
+def load_config():
+    """Load all persistent add-on state from Kodi settings."""
+    cfg = {}
+
+    server = _setting("server").strip().rstrip("/")
+    username = _setting("username").strip()
+    profile = ""
+
+    # Support username#profile in the username field.
+    if "#" in username:
+        username, inline_profile = username.split("#", 1)
+        username = username.strip()
+        profile = inline_profile.strip()
+
+    if server:
+        cfg["server"] = server
+    if username:
+        cfg["username"] = username
+    if profile:
+        cfg["profile_name"] = profile
+
+    raw_items = _setting("items_per_page")
+    try:
+        cfg["items_per_page"] = max(20, min(int(raw_items or 200), 200))
+    except (TypeError, ValueError):
+        cfg["items_per_page"] = 200
+
+    for key in _INTERNAL_SETTINGS:
+        value = _setting(key)
+
+        if not value:
+            continue
+
+        cfg[key] = value
+
+    return cfg
+
+
+def save_config(cfg):
+    """Persist only hidden/internal runtime state into Kodi settings.
+
+    Server and username are read-only settings and are already persisted by Kodi
+    itself. Pagination is also handled directly by Kodi. These are deliberately
+    not written here.
+    """
+    for key in _INTERNAL_SETTINGS:
+        if key not in cfg:
+            _set_setting(key, "")
+            continue
+
+        _set_setting(key, cfg[key])
+
+
+# Saved server profiles retain each server/account's independently rotating
+# tokens and selected profile. The Kodi installation ID remains global so every
+# server sees the same stable client device.
+_SERVER_PROFILE_KEYS = (
+    "server",
+    "username",
+    "auth_method",
+    "token",
+    "refresh_token",
+    "profile_id",
+    "profile_token",
+    "bandwidth_estimate_cache",
+)
+
+
+def _server_profile_key(server, username):
+    server = str(server or "").strip().rstrip("/")
+    username = str(username or "").strip()
+    try:
+        parts = urlsplit(server)
+        normalized_server = (
+            parts.scheme.lower() + "://" + parts.netloc.lower()
+            + parts.path.rstrip("/")
+        )
+    except Exception:
+        normalized_server = server
+    return normalized_server + "\n" + username.casefold()
+
+
+def _saved_servers_path():
+    folder = xbmcvfs.translatePath(ADDON.getAddonInfo("profile"))
+    if not folder:
+        folder = xbmcvfs.translatePath(
+            "special://profile/addon_data/plugin.video.kolo/"
+        )
+    xbmcvfs.mkdirs(folder)
+    return os.path.join(folder, "servers.json")
+
+
+def _load_saved_servers():
+    path = _saved_servers_path()
+    if not xbmcvfs.exists(path):
+        return []
+    handle = None
+    try:
+        handle = xbmcvfs.File(path, "r")
+        raw = handle.read()
+    except Exception as exc:
+        log("Unable to read saved Silo servers: %s" % exc, xbmc.LOGWARNING)
+        return []
+    finally:
+        if handle:
+            handle.close()
+
+    try:
+        data = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        log("Saved Silo server list is invalid JSON; starting with an empty list.", xbmc.LOGWARNING)
+        return []
+
+    items = data.get("servers", []) if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        return []
+
+    result = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        record = {
+            key: str(item.get(key) or "")
+            for key in _SERVER_PROFILE_KEYS
+        }
+        record["server"] = record["server"].strip().rstrip("/")
+        record["username"] = record["username"].strip()
+        record["server_name"] = str(item.get("server_name") or "").strip()
+        if not record["server"] or not record["username"]:
+            continue
+        record["key"] = _server_profile_key(
+            record["server"], record["username"]
+        )
+        if record["key"] in seen:
+            continue
+        seen.add(record["key"])
+        result.append(record)
+    return result
+
+
+def _save_saved_servers(records):
+    path = _saved_servers_path()
+    payload = {
+        "version": 1,
+        "servers": [
+            dict(
+                {key: str(record.get(key) or "") for key in _SERVER_PROFILE_KEYS},
+                server_name=str(record.get("server_name") or ""),
+            )
+            for record in records
+            if isinstance(record, dict)
+            and record.get("server")
+            and record.get("username")
+        ],
+    }
+    handle = None
+    try:
+        handle = xbmcvfs.File(path, "w")
+        handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+    except Exception as exc:
+        log("Unable to save Silo server list: %s" % exc, xbmc.LOGWARNING)
+    finally:
+        if handle:
+            handle.close()
+
+
+# Custom exception used for errors that should be shown/logged by Kodi.
+class SiloError(Exception):
+    def __init__(self, msg, status=None, problem=None, retry_after=None):
+        super().__init__(msg)
+        self.status = status
+        self.problem = problem or {}
+        self.retry_after = retry_after
+
+
+class SiloClient:
+    """Small authenticated client for Silo's v2 API."""
+
+    # Create the API client, load saved settings and create a stable Kodi device ID.
+    def __init__(self):
+        self.cfg = load_config()
+
+        if not self.cfg.get("device_id"):
+            self.cfg["device_id"] = "kodi-" + uuid.uuid4().hex[:16]
+            _set_setting("device_id", self.cfg["device_id"])
+
+        self.session = requests.Session()
+        self._caps = None
+        self._catalog_search_caps = None
+        self._last_refresh_status = None
+        self._last_refresh_problem = {}
+        self._last_refresh_transient = False
+        self.sync_settings()
+        # Detail responses are reused when the same item is later played.
+        self._details = {}
+
+    # ------------------------------------------------------------ settings
+
+    def sync_settings(self):
+        """Refresh editable connection/profile settings from Kodi."""
+        raw_username = ADDON.getSetting("username").strip()
+        server = ADDON.getSetting("server").strip().rstrip("/")
+        profile = ""
+
+        username = raw_username
+
+        if "#" in raw_username:
+            username, inline_profile = raw_username.split("#", 1)
+            username = username.strip()
+            profile = inline_profile.strip()
+
+        old_identity = (
+            self.cfg.get("server", ""),
+            self.cfg.get("username", ""),
+            self.cfg.get("profile_name", ""),
+        )
+        new_identity = (
+            server,
+            username,
+            profile,
+        )
+
+        if new_identity != old_identity:
+            for key in ("token", "refresh_token", "profile_id", "profile_token", "bandwidth_estimate_cache"):
+                self.cfg.pop(key, None)
+            self._caps = None
+
+        self.cfg["server"] = server if server else self.cfg.get("server", "")
+        self.cfg["username"] = username if username else self.cfg.get("username", "")
+
+        if profile:
+            self.cfg["profile_name"] = profile
+        else:
+            self.cfg.pop("profile_name", None)
+
+        # Server, username and profile are already persisted by Kodi's
+        # settings store. Do not call save_config() here: doing so could clear
+        # an internal token if Kodi has not yet exposed that setting value to
+        # this Addon instance.
+
+
+
+    # ------------------------------------------------------------ helpers
+
+    def server_display_name(self, server_url=None):
+        """Return the same branded name used by the root menu, or the URL."""
+        server_url = str(
+            server_url if server_url is not None else self.base or _setting("server") or ""
+        ).strip().rstrip("/")
+        if not server_url:
+            return "Silo"
+
+        # Reuse a previously discovered custom name for alternate servers so
+        # the selector stays responsive even when a server is temporarily offline.
+        records = _load_saved_servers()
+        target = server_url.casefold()
+        for record in records:
+            if str(record.get("server") or "").rstrip("/").casefold() == target:
+                cached_name = str(record.get("server_name") or "").strip()
+                if cached_name and cached_name.casefold() != "silo":
+                    return cached_name
+
+        branding = self._get_public_json(
+            "/api/v2/theme/branding",
+            base_url=server_url,
+            timeout=4,
+        ) or {}
+        name = str(branding.get("server_name") or "").strip() if isinstance(branding, dict) else ""
+
+        # "Silo" is the server's stock branding. Use its URL in that case so
+        # multiple default-branded installations remain distinguishable.
+        if not name or name.casefold() == "silo":
+            return server_url
+
+        # Cache the discovered name without changing the server's auth data.
+        changed = False
+        for record in records:
+            if str(record.get("server") or "").rstrip("/").casefold() == target:
+                record["server_name"] = name
+                changed = True
+        if changed:
+            _save_saved_servers(records)
+        return name
+
+    # Base server URL used for every Silo API request.
+    @property
+    def base(self):
+        return self.cfg.get("server", "").rstrip("/")
+
+    # Convert relative Silo URLs such as /api/... into absolute URLs.
+    def abs_url(self, url):
+        if not url:
+            return ""
+        return self.base + url if url.startswith("/") else url
+
+    # Build authentication/client headers required by Silo API endpoints.
+    # send_profile=False leaves out X-Profile-Id/X-Profile-Token, which the
+    # PIN check must not send: the server refuses a request naming a locked
+    # profile without its token, so that request would never reach the check.
+    def _headers(self, send_profile=True):
+        # Kodi's settings store is authoritative. Read the live values
+        # directly instead of relying on a potentially stale in-memory cfg.
+        device_id = _setting("device_id")
+        token = _setting("token")
+        profile_id = _setting("profile_id")
+        profile_token = _setting("profile_token")
+
+        if not device_id:
+            device_id = "kodi-" + uuid.uuid4().hex[:16]
+            _set_setting("device_id", device_id)
+
+        self.cfg["device_id"] = device_id
+
+        h = {
+            "Accept": "application/json",
+            "X-Device-ID": device_id,
+            "X-Client-Name": "plugin.video.kolo",
+            "X-Client-Version": ADDON_VERSION,
+            "X-Client-Platform": "kodi",
+        }
+
+        if token:
+            h["Authorization"] = "Bearer " + token
+            self.cfg["token"] = token
+
+        if profile_id and send_profile:
+            h["X-Profile-Id"] = str(profile_id)
+            self.cfg["profile_id"] = str(profile_id)
+
+        if profile_token and send_profile:
+            h["X-Profile-Token"] = str(profile_token)
+            self.cfg["profile_token"] = str(profile_token)
+
+        return h
+
+    @staticmethod
+    def _problem(r):
+        """Create a readable message from a Silo problem+json response."""
+        try:
+            p = r.json()
+        except ValueError:
+            return "HTTP %s: %s" % (r.status_code, (r.text or r.reason)[:300])
+
+        errors = p.get("errors") or []
+        fields = [
+            "%s [%s] %s" % (
+                e.get("location", "?"),
+                e.get("code", ""),
+                e.get("detail", ""),
+            )
+            for e in errors[:8]
+        ]
+
+        head = p.get("detail") or p.get("title") or r.reason
+
+        return "HTTP %s: %s%s" % (
+            r.status_code,
+            head,
+            ("\n" + "\n".join(fields)) if fields else "",
+        )
+
+    @staticmethod
+    def _retry_after_delay(value, attempt):
+        """Parse Retry-After and cap the delay for a synchronous Kodi request."""
+        delay = None
+        raw = str(value or "").strip()
+        if raw:
+            try:
+                delay = float(raw)
+            except (TypeError, ValueError):
+                try:
+                    retry_at = parsedate_to_datetime(raw)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=datetime.timezone.utc)
+                    delay = retry_at.timestamp() - time.time()
+                except (TypeError, ValueError, OverflowError):
+                    delay = None
+
+        if delay is None or delay <= 0:
+            delay = float(2 ** max(0, int(attempt or 0)))
+        return min(15.0, max(0.25, float(delay)))
+
+    # Send an authenticated API request and handle access-token/profile-token retries.
+    def _send(self, method, path, params=None, body=None, need_profile=True, retry=True, timeout=30, log_not_found=True, extra_headers=None, stream=False, send_profile=True):
+        if not self.base:
+            self._prompt_account()
+
+        if not _setting("token"):
+            self.cfg.pop("token", None)
+
+            # A stored refresh token is sufficient to restore an expired or
+            # otherwise missing access token. Never ask for the password just
+            # because Kodi restarted or the access token was lost locally.
+            if _setting("refresh_token"):
+                if not self.refresh():
+                    if self._last_refresh_transient:
+                        raise SiloError(
+                            "Silo session refresh is temporarily unavailable; try again later."
+                        )
+
+                    # The server definitively rejected the refresh token, so
+                    # this session can no longer be restored silently.
+                    self.cfg.pop("token", None)
+                    self.cfg.pop("refresh_token", None)
+                    _set_setting("token", "")
+                    _set_setting("refresh_token", "")
+                    self.login()
+            else:
+                self.login()
+
+        # Renew a JWT shortly before expiry so normal browsing/playback does
+        # not wait for an expired-token 401 to trigger the refresh path.
+        self.ensure_access_token_fresh()
+
+        if need_profile and not self.cfg.get("profile_id"):
+            self.select_profile()
+
+        headers = self._headers(send_profile=send_profile)
+        if extra_headers:
+            headers.update(extra_headers)
+
+        # A 429 is replayed only for safe reads. Mutations and playback starts
+        # fail immediately to avoid duplicating a write with an uncertain result.
+        retry_rate_limit = str(method or "").upper() in ("GET", "HEAD", "OPTIONS")
+        rate_limit_attempt = 0
+        while True:
+            try:
+                r = self.session.request(
+                    method,
+                    self.base + path,
+                    headers=headers,
+                    params=params,
+                    json=body,
+                    timeout=timeout,
+                    stream=stream,
+                )
+            except requests.RequestException as e:
+                raise SiloError("Cannot reach server: %s" % e)
+
+            if r.status_code != 429 or not retry_rate_limit or rate_limit_attempt >= 2:
+                break
+
+            delay = self._retry_after_delay(
+                r.headers.get("Retry-After"),
+                rate_limit_attempt,
+            )
+            log(
+                "Silo rate limited %s %s; retrying safe request in %.2fs (attempt %d/2)"
+                % (method, path, delay, rate_limit_attempt + 1),
+                xbmc.LOGWARNING,
+            )
+            try:
+                r.close()
+            except Exception:
+                pass
+            time.sleep(delay)
+            rate_limit_attempt += 1
+
+        # A 401 may mean the access token has expired. Refresh it and retry once.
+        if r.status_code == 401 and retry:
+            if not self.refresh():
+                # Do not throw away a potentially valid session when the
+                # refresh failed because of a transient network/server issue.
+                if self._last_refresh_transient:
+                    raise SiloError(
+                        "Silo session refresh is temporarily unavailable; try again later.",
+                        r.status_code,
+                        {},
+                    )
+
+                # A definitive refresh-token refusal means the server has
+                # ended this session. Start a fresh credential login.
+                self.cfg.pop("token", None)
+                self.cfg.pop("refresh_token", None)
+                _set_setting("token", "")
+                _set_setting("refresh_token", "")
+                save_config(self.cfg)
+                self.login()
+
+            return self._send(
+                method,
+                path,
+                params,
+                body,
+                need_profile,
+                False,
+                timeout,
+                log_not_found,
+                extra_headers,
+                stream,
+                send_profile,
+            )
+
+        # A locked profile may need a fresh profile-verification token. Never
+        # answer a refused PIN check with another PIN prompt: that loops.
+        if r.status_code == 403 and retry and send_profile and "profile_verification" in r.text:
+            self.cfg.pop("profile_token", None)
+            self.verify_profile(self.cfg.get("profile_id"))
+            return self._send(
+                method,
+                path,
+                params,
+                body,
+                need_profile,
+                False,
+                timeout,
+                log_not_found,
+                extra_headers,
+            )
+
+        if not r.ok:
+            if not (r.status_code == 404 and not log_not_found):
+                log(
+                    "%s %s -> %s" % (method, path, r.text[:1200]),
+                    xbmc.LOGWARNING,
+                )
+
+            try:
+                problem = r.json()
+            except ValueError:
+                problem = {}
+
+            retry_after = r.headers.get("Retry-After")
+            raise SiloError(
+                self._problem(r),
+                r.status_code,
+                problem,
+                retry_after,
+            )
+
+        return r
+
+    # Convenience wrapper that sends a request and decodes the JSON response.
+    def _json(self, *args, **kwargs):
+        r = self._send(*args, **kwargs)
+        return r.json() if r.content else None
+
+    # --------------------------------------------------------------- auth
+
+    # Ask for the server and username the first time the addon is configured.
+    def _prompt_account(self):
+        self._prompt_server()
+        self._prompt_username()
+
+    # Ask for the server URL. Code sign-in needs only this; password sign-in
+    # goes on to _prompt_username().
+    def _prompt_server(self):
+        server = xbmcgui.Dialog().input(
+            "Silo server URL (e.g. http://host:8090)",
+            defaultt="http://",
+        )
+
+        if not server:
+            raise SiloError("Login cancelled")
+
+        server = server.rstrip("/")
+        ADDON.setSetting("server", server)
+        self.cfg["server"] = server
+        save_config(self.cfg)
+
+    def _prompt_username(self):
+        server = self.base
+        user = xbmcgui.Dialog().input(
+            "Silo username",
+            defaultt="",
+        )
+
+        if not user:
+            raise SiloError("Login cancelled")
+
+        # A '#' is optional. Without it, retain the normal profile-selection
+        # dialog. With it, use the part before '#' as the account username and
+        # the part after '#' as the profile name.
+        user = user.strip()
+
+        ADDON.setSetting("username", user)
+
+        if "#" in user:
+            username, profile_name = user.split("#", 1)
+            username = username.strip()
+            profile_name = profile_name.strip()
+
+            if not username or not profile_name:
+                ADDON.setSetting("server", "")
+                ADDON.setSetting("username", "")
+                raise SiloError(
+                    "Use username#profile, for example liam1#liam2"
+                )
+
+            ADDON.setSetting("username", username)
+            self.cfg["username"] = username
+            self.cfg["profile_name"] = profile_name
+            self._requested_profile_name = profile_name
+        else:
+            self.cfg["username"] = user
+            self.cfg.pop("profile_name", None)
+            self._requested_profile_name = ""
+
+        self.cfg["server"] = server
+        save_config(self.cfg)
+
+    # Store the access/refresh token pair returned by Silo.
+    def _store_tokens(self, data):
+        access_token = str(data.get("access_token") or "")
+        refresh_token = str(data.get("refresh_token") or "")
+
+        if not access_token or not refresh_token:
+            raise SiloError("Silo login did not return authentication tokens")
+
+        self.cfg["token"] = access_token
+        self.cfg["refresh_token"] = refresh_token
+
+        # Persist authentication immediately in Kodi's settings store.
+        _set_setting("token", access_token)
+        _set_setting("refresh_token", refresh_token)
+
+        log("Silo authentication tokens saved to Kodi settings")
+
+    # Authenticate directly with /auth/login.
+    #
+    # This deliberately does NOT call _send(), because _send() calls login()
+    # when a token is missing. Calling _send() here would recurse forever.
+    def login(self, show_loading=False):
+        # An account that signed in with a code may have no password, so a
+        # forced re-login (for example after the server ended the session)
+        # asks for a new code instead.
+        if _setting("auth_method") == AUTH_METHOD_DEVICE:
+            if not self.base:
+                self._prompt_server()
+            self.login_with_device_code(show_loading=show_loading)
+            return
+
+        if not self.base or not self.cfg.get("username"):
+            self._prompt_account()
+
+        # Never leave the busy dialog covering an input prompt. The loading
+        # indicator starts only after the password has been submitted.
+        _hide_login_loading()
+
+        pw = xbmcgui.Dialog().input(
+            "Password for %s" % self.cfg["username"],
+            option=xbmcgui.ALPHANUM_HIDE_INPUT,
+        )
+
+        if not pw:
+            raise SiloError("Login cancelled")
+
+        # Start Kodi's native busy spinner immediately after the password
+        # prompt closes, before the network authentication request begins.
+        if show_loading:
+            _show_login_loading()
+
+        try:
+            r = self.session.post(
+                self.base + "/api/v2/auth/login",
+                timeout=20,
+                headers={
+                    "Accept": "application/json",
+                    "X-Device-ID": self.cfg["device_id"],
+                    "X-Client-Name": "plugin.video.kolo",
+                    "X-Client-Version": ADDON_VERSION,
+                    "X-Client-Platform": "kodi",
+                },
+                json={
+                    "username": self.cfg["username"],
+                    "password": pw,
+                    "provider": "",
+                },
+            )
+        except requests.RequestException as e:
+            if show_loading:
+                _hide_login_loading()
+            raise SiloError("Cannot reach server: %s" % e)
+
+        if not r.ok:
+            if show_loading:
+                _hide_login_loading()
+            raise SiloError("Login failed - " + self._problem(r))
+
+        try:
+            self._store_tokens(r.json())
+        except Exception:
+            if show_loading:
+                _hide_login_loading()
+            raise
+
+        _set_setting("auth_method", AUTH_METHOD_PASSWORD)
+
+    # Headers for requests made before the addon has a session.
+    def _client_headers(self):
+        return {
+            "Accept": "application/json",
+            "X-Device-ID": _setting("device_id") or self.cfg["device_id"],
+            "X-Client-Name": "plugin.video.kolo",
+            "X-Client-Version": ADDON_VERSION,
+            "X-Client-Platform": "kodi",
+        }
+
+    # Fetch an unauthenticated JSON document, or None when the server does
+    # not answer it (an older server without the endpoint, or a network error).
+    def _get_public_json(self, path, base_url=None, timeout=15):
+        request_base = str(base_url or self.base or "").rstrip("/")
+        if not request_base:
+            return None
+        try:
+            r = self.session.get(
+                request_base + path,
+                headers=self._client_headers(),
+                timeout=timeout,
+            )
+        except requests.RequestException as e:
+            log("GET %s unavailable: %s" % (path, e), xbmc.LOGDEBUG)
+            return None
+
+        if not r.ok:
+            log("GET %s -> HTTP %s" % (path, r.status_code), xbmc.LOGDEBUG)
+            return None
+
+        try:
+            return r.json()
+        except ValueError:
+            return None
+
+    # Decide how to sign in to the server in self.base. Offers the choice
+    # only when the server supports both methods.
+    def _choose_sign_in_method(self):
+        capability = self._get_public_json("/api/v2/auth/device/capability") or {}
+        providers = self._get_public_json("/api/v2/auth/providers")
+
+        device_ok = capability.get("state") == "available"
+        # Servers that predate password_login always accept passwords.
+        password_ok = (providers or {}).get("password_login", True) is not False
+
+        if device_ok and password_ok:
+            idx = xbmcgui.Dialog().select(
+                "Sign in to Silo",
+                [
+                    "Sign in with a code",
+                    "Sign in with username and password",
+                ],
+            )
+            if idx < 0:
+                raise SiloError("Login cancelled")
+            return AUTH_METHOD_DEVICE if idx == 0 else AUTH_METHOD_PASSWORD
+
+        if device_ok:
+            return AUTH_METHOD_DEVICE
+        if password_ok:
+            return AUTH_METHOD_PASSWORD
+
+        raise SiloError(
+            "This server does not accept passwords and does not support code sign-in"
+        )
+
+    # Sign in by showing a code that the person approves on the server's
+    # /activate page or in a Silo phone app. Kodi never handles a password.
+    #
+    # Like login(), this deliberately does NOT call _send().
+    def login_with_device_code(self, show_loading=False):
+        _hide_login_loading()
+
+        while True:
+            outcome = self._run_device_code_attempt()
+
+            if outcome == "expired":
+                again = xbmcgui.Dialog().yesno(
+                    "Sign in to Silo",
+                    "The code expired before it was used. Get a new code?",
+                )
+                if again:
+                    continue
+                raise SiloError("Login cancelled")
+
+            break
+
+        if show_loading:
+            _show_login_loading()
+
+    # Run one code from start to approval. Returns "approved" or "expired";
+    # raises SiloError for every other ending.
+    def _run_device_code_attempt(self):
+        friendly_name = str(xbmc.getInfoLabel("System.FriendlyName") or "").strip()
+        device_name = "Kodi on %s" % friendly_name if friendly_name else "Kodi"
+
+        try:
+            r = self.session.post(
+                self.base + "/api/v2/auth/device/start",
+                headers=self._client_headers(),
+                json={"device_name": device_name, "device_platform": "Kodi"},
+                timeout=20,
+            )
+        except requests.RequestException as e:
+            raise SiloError("Cannot reach server: %s" % e)
+
+        if not r.ok:
+            raise SiloError("Code sign-in failed - " + self._problem(r))
+
+        start = r.json()
+        device_code = start["device_code"]
+        # The wire form is 4821-7730; people read it as 4821 7730.
+        user_code = str(start.get("user_code") or "").replace("-", " ")
+        verification_uri = start.get("verification_uri") or (self.base + "/activate")
+        interval = max(1, int(start.get("interval") or 5))
+        deadline = _parse_server_time(start.get("expires_at"))
+        if deadline is None:
+            deadline = time.time() + int(start.get("expires_in") or 900)
+
+        instructions = (
+            "On your phone or computer, open\n[B]%s[/B]\nand enter the code [B]%s[/B]"
+            % (verification_uri, user_code)
+        )
+        opened_instructions = (
+            "Code [B]%s[/B] was entered.\nFinish signing in on your phone or computer."
+            % user_code
+        )
+
+        progress = xbmcgui.DialogProgress()
+        progress.create("Sign in to Silo", instructions)
+        monitor = xbmc.Monitor()
+        message = instructions
+        total = max(1.0, deadline - time.time())
+        next_poll = time.time() + interval
+
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return "expired"
+
+                progress.update(int(100 * remaining / total), message)
+
+                if progress.iscanceled() or monitor.waitForAbort(0.5):
+                    self._cancel_device_code(device_code)
+                    raise SiloError("Login cancelled")
+
+                if time.time() < next_poll:
+                    continue
+
+                try:
+                    r = self.session.post(
+                        self.base + "/api/v2/auth/device/poll",
+                        headers=self._client_headers(),
+                        json={"device_code": device_code},
+                        timeout=20,
+                    )
+                except requests.RequestException as e:
+                    # Keep the code on screen through a network blip.
+                    log("Device sign-in poll unavailable: %s" % e, xbmc.LOGWARNING)
+                    next_poll = time.time() + interval
+                    continue
+
+                if r.status_code == 429 or r.status_code >= 500:
+                    wait = interval
+                    try:
+                        wait = max(interval, int(r.headers.get("Retry-After") or interval))
+                    except ValueError:
+                        pass
+                    next_poll = time.time() + wait
+                    continue
+
+                if r.status_code == 404:
+                    # The server no longer knows this request.
+                    return "expired"
+
+                if not r.ok:
+                    raise SiloError("Code sign-in failed - " + self._problem(r))
+
+                poll = r.json()
+                status = poll.get("status")
+                interval = max(1, int(poll.get("poll_after") or interval))
+                next_poll = time.time() + interval
+
+                if status == "pending":
+                    # An approver looking the code up can move its expiry later.
+                    moved = _parse_server_time(poll.get("expires_at"))
+                    if moved is not None and moved > deadline:
+                        total += moved - deadline
+                        deadline = moved
+                    if poll.get("opened"):
+                        message = opened_instructions
+                    continue
+
+                if status == "approved":
+                    tokens = poll.get("tokens") or {}
+                    self._store_tokens(tokens)
+                    self._remember_device_sign_in(tokens.get("user") or {})
+                    return "approved"
+
+                if status == "expired":
+                    return "expired"
+
+                if status == "denied":
+                    raise SiloError("The sign-in request was declined")
+
+                # canceled or consumed: this code can no longer sign in.
+                raise SiloError("The sign-in request is no longer valid (%s)" % status)
+        finally:
+            progress.close()
+
+    # Record who signed in with the code, so the Settings page shows the
+    # account and a later re-login asks for a code again.
+    def _remember_device_sign_in(self, user):
+        username = str(user.get("username") or "").strip()
+        if username:
+            ADDON.setSetting("username", username)
+            self.cfg["username"] = username
+        self.cfg.pop("profile_name", None)
+        self._requested_profile_name = ""
+        _set_setting("auth_method", AUTH_METHOD_DEVICE)
+
+    # Withdraw a code the person backed out of, so it can't be approved later.
+    def _cancel_device_code(self, device_code):
+        try:
+            self.session.post(
+                self.base + "/api/v2/auth/device/cancel",
+                headers=self._client_headers(),
+                json={"device_code": device_code},
+                timeout=10,
+            )
+        except requests.RequestException as e:
+            log("Device sign-in cancel unavailable: %s" % e, xbmc.LOGWARNING)
+
+
+    # --------------------------------------------------------- saved servers
+
+    def remember_current_server(self):
+        """Persist the active server/account after a successful sign-in."""
+        server = _setting("server").strip().rstrip("/")
+        username = _setting("username").strip()
+        if not server or not username:
+            return None
+        if not (_setting("token") or _setting("refresh_token")):
+            return None
+
+        record = {
+            key: _setting(key)
+            for key in _SERVER_PROFILE_KEYS
+        }
+        record["server"] = server
+        record["username"] = username
+        record["key"] = _server_profile_key(server, username)
+
+        records = _load_saved_servers()
+        existing = next(
+            (item for item in records if item.get("key") == record["key"]),
+            None,
+        )
+        record["server_name"] = (
+            (existing or {}).get("server_name")
+            or self.server_display_name(server)
+        )
+        records = [
+            item for item in records
+            if item.get("key") != record["key"]
+        ]
+        records.append(record)
+        _save_saved_servers(records)
+        return record
+
+    def list_saved_servers(self):
+        """Return saved server/account records, refreshing the active record."""
+        self.remember_current_server()
+        records = _load_saved_servers()
+        return sorted(
+            records,
+            key=lambda item: (
+                item.get("server", "").casefold(),
+                item.get("username", "").casefold(),
+            ),
+        )
+
+    def switch_to_server(self, server, username):
+        """Load a saved server's own token/profile state into Kodi settings."""
+        self.remember_current_server()
+        target_key = _server_profile_key(server, username)
+        target = next(
+            (item for item in _load_saved_servers()
+             if item.get("key") == target_key),
+            None,
+        )
+        if not target:
+            raise SiloError("That saved Silo server could not be found.")
+        if not (target.get("token") or target.get("refresh_token")):
+            raise SiloError("That saved server has no reusable sign-in. Add it again.")
+
+        for key in _SERVER_PROFILE_KEYS:
+            _set_setting(key, target.get(key, ""))
+
+        # Device ID deliberately stays global. Reload every server-scoped value
+        # and clear caches which could otherwise leak across server boundaries.
+        self.cfg = load_config()
+        self._caps = None
+        self._details = {}
+        self._requested_profile_name = ""
+        return target
+
+    def forget_current_server(self):
+        """Remove the active server/account from the saved switcher."""
+        key = _server_profile_key(
+            _setting("server"),
+            _setting("username"),
+        )
+        if not key.strip():
+            return
+        records = [
+            item for item in _load_saved_servers()
+            if item.get("key") != key
+        ]
+        _save_saved_servers(records)
+
+    # Complete interactive login used by the Kodi Login button.
+    #
+    # This intentionally performs the whole initial-login sequence in one
+    # place: server/username/password, token storage, profile selection and
+    # profile PIN verification when required.
+    def login_full(self):
+        # Explicit login starts with no busy spinner so the server, username
+        # and password prompts are unobstructed.
+        _hide_login_loading()
+
+        # Preserve the current account before the fresh-login flow clears the
+        # active settings. This also makes Add Server safe while another server
+        # is already configured.
+        self.remember_current_server()
+
+        # Every explicit Kodi login starts as a completely fresh attempt.
+        # Do not reuse a previously entered server, username, token or profile
+        # after a failed/cancelled login; this ensures the next attempt always
+        # starts at the server URL prompt.
+        for key in (
+            "server",
+            "username",
+            "token",
+            "refresh_token",
+            "profile_id",
+            "profile_token",
+        ):
+            self.cfg.pop(key, None)
+
+        self._caps = None
+        self._requested_profile_name = ""
+        for key in ("token", "refresh_token", "profile_id", "profile_token", "auth_method"):
+            _set_setting(key, "")
+        save_config(self.cfg)
+
+        try:
+            # Ask for the server first, then sign in with a code or with a
+            # username and password, whichever the server offers.
+            self._prompt_server()
+
+            if self._choose_sign_in_method() == AUTH_METHOD_DEVICE:
+                self.login_with_device_code(show_loading=True)
+            else:
+                self._prompt_username()
+                self.login(show_loading=True)
+
+            # Keep the spinner active when the account can select its
+            # profile automatically. select_profile() pauses it only when Kodi
+            # actually needs to display a profile or PIN prompt.
+            self.select_profile()
+            self.remember_current_server()
+
+        except SiloError:
+            # Always close the loading indicator on a failed or cancelled login.
+            _hide_login_loading()
+
+            # A bad password, unknown user/server, cancelled prompt, cancelled
+            # profile selection, or cancelled PIN must leave no partial login
+            # state behind. The next Login selection will start at server URL.
+            for key in (
+                "server",
+                "username",
+                "token",
+                "refresh_token",
+                "profile_id",
+                "profile_token",
+            ):
+                self.cfg.pop(key, None)
+
+            self._caps = None
+            self._requested_profile_name = ""
+            for key in ("token", "refresh_token", "profile_id", "profile_token", "auth_method"):
+                _set_setting(key, "")
+            save_config(self.cfg)
+            raise
+
+    # Exchange the saved refresh token for a new access token.
+    def refresh(self):
+        """Rotate the Silo access/refresh pair without prompting for a password."""
+        with _REFRESH_LOCK:
+            # A different SiloClient (or another Kodi process) may have
+            # already rotated the refresh token. Re-read persistent settings
+            # before every exchange and retry once when a newer token appears.
+            for attempt in range(2):
+                rt = _setting("refresh_token") or self.cfg.get("refresh_token")
+                if not rt or not self.base:
+                    self._last_refresh_status = None
+                    self._last_refresh_problem = {}
+                    self._last_refresh_transient = False
+                    return False
+
+                try:
+                    r = self.session.post(
+                        self.base + "/api/v2/auth/refresh",
+                        headers={
+                            "Accept": "application/json",
+                            "X-Device-ID": _setting("device_id") or self.cfg["device_id"],
+                            "X-Client-Name": "plugin.video.kolo",
+                            "X-Client-Version": ADDON_VERSION,
+                            "X-Client-Platform": "kodi",
+                        },
+                        json={"refresh_token": rt},
+                        timeout=20,
+                    )
+                except requests.RequestException as exc:
+                    self._last_refresh_status = None
+                    self._last_refresh_problem = {}
+                    self._last_refresh_transient = True
+                    log("Silo token refresh unavailable: %s" % exc, xbmc.LOGWARNING)
+                    return False
+
+                self._last_refresh_status = r.status_code
+
+                try:
+                    problem = r.json() if not r.ok else {}
+                except ValueError:
+                    problem = {}
+
+                if not r.ok:
+                    self._last_refresh_problem = problem
+                    log("Silo refresh response status=%d type=%s detail=%s" % (r.status_code, problem.get("type") or "", problem.get("detail") or ""), xbmc.LOGWARNING)
+                    self._last_refresh_transient = (
+                        r.status_code >= 500 or r.status_code in (408, 429)
+                    )
+
+                    # Refresh tokens rotate. If another client won the
+                    # exchange between our reads, the server rejects the
+                    # old token even though the session is still valid.
+                    latest_rt = _setting("refresh_token")
+                    if (
+                        attempt == 0
+                        and r.status_code == 401
+                        and latest_rt
+                        and latest_rt != rt
+                    ):
+                        log(
+                            "Silo refresh token was rotated elsewhere; retrying with the current token",
+                            xbmc.LOGWARNING,
+                        )
+                        continue
+
+                    log(
+                        "Silo token refresh failed -> %s %s"
+                        % (
+                            r.status_code,
+                            problem.get("detail") or problem.get("title") or "",
+                        ),
+                        xbmc.LOGWARNING,
+                    )
+                    return False
+
+                try:
+                    data = r.json()
+                    self._store_tokens(data)
+                except (ValueError, SiloError) as exc:
+                    self._last_refresh_problem = {}
+                    self._last_refresh_transient = True
+                    log(
+                        "Silo token refresh returned an invalid response: %s" % exc,
+                        xbmc.LOGWARNING,
+                    )
+                    return False
+
+                log("Silo access token refreshed automatically")
+                return True
+
+            return False
+
+
+    def ensure_access_token_fresh(self):
+        """Refresh the access token shortly before a JWT expires."""
+        token = str(_setting("token") or self.cfg.get("token") or "").strip()
+        if not token:
+            return False
+
+        self.cfg["token"] = token
+        expiry = self.access_token_expiry()
+        if expiry is None:
+            return True
+
+        if expiry - time.time() > ACCESS_TOKEN_REFRESH_MARGIN:
+            return True
+
+        # Another request may already have refreshed while this client was
+        # waiting. The refresh lock makes the token rotation safe.
+        if self.refresh():
+            return True
+
+        # A failed refresh must not turn a temporary network/server problem
+        # into a password prompt. Keep the current access token and let the
+        # request below decide whether the server still accepts it.
+        return True
+
+    # Fully log the account out locally.
+    #
+    # Server and username are deliberately removed as well as the tokens and
+    # profile information. This makes the next use a completely fresh login,
+    # allowing the user to enter a different server and/or username instead of
+    # being forced to reuse the previous account. The stable Kodi device ID is
+    # intentionally retained so Silo still recognises this Kodi installation
+    # as the same device after logging into another account.
+    def logout(self, forget_saved=False):
+        # Save the latest rotating refresh token and profile state before
+        # clearing the active settings. Explicit removal skips this save.
+        if forget_saved:
+            self.forget_current_server()
+        else:
+            self.remember_current_server()
+
+        # Clear the editable account settings from Kodi itself as well as the
+        # in-memory client state. Keeping these values would cause the next
+        # addon launch to use the settings-first login path and ask only for
+        # the password.
+        for key in (
+            "server",
+            "username",
+            "auth_method",
+            "token",
+            "refresh_token",
+            "profile_id",
+            "profile_token",
+        ):
+            self.cfg.pop("server" if key == "server" else key, None)
+            _set_setting(key, "")
+
+        # Keep the stable device ID, but discard account/profile-specific state.
+        self.cfg.pop("profile_name", None)
+        self._caps = None
+        self._requested_profile_name = ""
+
+        log("Silo account settings and authentication state cleared")
+
+    # Return the access-token expiry without logging or exposing the token.
+    # Silo currently uses JWT access tokens. Decoding the payload is sufficient
+    # here because this value is only used as a local scheduling hint; the server
+    # remains authoritative for authentication and every API call still handles
+    # 401 by refreshing normally.
+    def access_token_expiry(self):
+        token = str(self.cfg.get("token") or _setting("token") or "").strip()
+        if not token:
+            return None
+
+        try:
+            parts = token.split(".")
+            if len(parts) != 3:
+                return None
+
+            payload = parts[1]
+            payload += "=" * (-len(payload) % 4)
+            decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+            claims = json.loads(decoded.decode("utf-8"))
+            expiry = claims.get("exp")
+            if expiry is None:
+                return None
+
+            return float(expiry)
+        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+            return None
+        except Exception:
+            return None
+
+    # ----------------------------------------------------------- profiles
+
+    def profiles(self):
+        """Return profiles visible to the signed-in account."""
+        data = self._json(
+            "GET",
+            "/api/v2/profiles",
+            need_profile=False,
+        ) or {}
+        items = data.get("items", [])
+        return items if isinstance(items, list) else []
+
+    def current_profile_name(self):
+        """Resolve the active profile ID to the name shown in Kodi."""
+        current_id = str(
+            _setting("profile_id") or self.cfg.get("profile_id") or ""
+        ).strip()
+        if not current_id:
+            return ""
+        for profile in self.profiles():
+            if str(profile.get("id") or "").strip() == current_id:
+                return str(profile.get("name") or "").strip()
+        return ""
+
+    # Load household profiles and remember the selected profile. During an
+    # explicit profile switch, selecting the already-active profile cancels.
+    def select_profile(self, cancel_if_current=False):
+        profiles = self.profiles()
+
+        if not profiles:
+            raise SiloError("This account has no profiles")
+
+        requested_name = "" if cancel_if_current else str(
+            getattr(self, "_requested_profile_name", "")
+            or self.cfg.get("profile_name", "")
+            or ""
+        ).strip()
+
+        if requested_name:
+            chosen = next(
+                (
+                    profile
+                    for profile in profiles
+                    if str(profile.get("name", "")).strip().casefold()
+                    == requested_name.casefold()
+                ),
+                None,
+            )
+
+            if chosen is None:
+                raise SiloError(
+                    "Profile '%s' was not found. Use username#profile."
+                    % requested_name
+                )
+        elif len(profiles) == 1:
+            # There is no profile chooser to display, so leave the login
+            # spinner active and select the only profile automatically.
+            chosen = profiles[0]
+        else:
+            # A real profile-selection dialog needs to be visible to the user,
+            # so temporarily close the login spinner while Kodi displays it.
+            _hide_login_loading()
+            current_id = str(
+                _setting("profile_id") or self.cfg.get("profile_id") or ""
+            ).strip()
+            labels = []
+            for profile in profiles:
+                name = str(profile.get("name") or "Profile")
+                if current_id and str(profile.get("id") or "").strip() == current_id:
+                    name += " (current)"
+                labels.append(name)
+
+            idx = xbmcgui.Dialog().select(
+                "Who's watching?",
+                labels,
+            )
+
+            if idx < 0:
+                if cancel_if_current and current_id:
+                    # Closing the chooser is the same as keeping the active
+                    # profile. Do not turn an intentional cancel into an error.
+                    return False
+                raise SiloError("No profile selected")
+
+            chosen = profiles[idx]
+            dialog_shown = True
+
+        if (
+            cancel_if_current
+            and str(chosen.get("id") or "").strip()
+            and str(chosen.get("id") or "").strip()
+            == str(_setting("profile_id") or self.cfg.get("profile_id") or "").strip()
+        ):
+            # The user chose the current profile; treat it as cancelling the
+            # switch. Do not clear/re-request the PIN token or refresh the UI.
+            return False
+
+        if len(profiles) > 1 and not requested_name:
+            # Resume the existing login spinner only for a real profile change.
+            _show_login_loading()
+
+        self.cfg["profile_id"] = str(chosen["id"])
+        self.cfg.pop("profile_token", None)
+
+        # Persist profile selection directly in Kodi's settings store so a
+        # new plugin invocation can immediately reuse the selected profile.
+        _set_setting("profile_id", self.cfg["profile_id"])
+        _set_setting("profile_token", "")
+
+        # The selected profile ID is stored internally. The visible settings
+        # page intentionally has no editable profile-name field.
+
+        if chosen.get("has_pin"):
+            # The PIN prompt must be visible, so pause the spinner for it and
+            # resume the same login spinner afterwards.
+            _hide_login_loading()
+            try:
+                self.verify_profile(chosen["id"])
+            finally:
+                _show_login_loading()
+
+        return True
+
+    # Verify a PIN-locked profile and store its temporary verification token.
+    def verify_profile(self, profile_id):
+        pin = xbmcgui.Dialog().input(
+            "Profile PIN",
+            type=xbmcgui.INPUT_NUMERIC,
+            option=xbmcgui.ALPHANUM_HIDE_INPUT,
+        )
+
+        if not pin:
+            raise SiloError("PIN required")
+
+        # Each check counts toward the server's five-attempt lockout, so it is
+        # sent once, without the profile headers it does not need.
+        data = self._json(
+            "POST",
+            "/api/v2/profiles/%s/verify-pin" % profile_id,
+            body={"pin": pin},
+            need_profile=False,
+            send_profile=False,
+        )
+
+        if not data or not data.get("valid"):
+            raise SiloError("Wrong PIN")
+
+        self.cfg["profile_token"] = data.get("profile_token", "")
+        _set_setting("profile_token", self.cfg["profile_token"])
+
+    # ------------------------------------------------------------ browsing
+
+    @staticmethod
+    def _next(data):
+        """Return the next API cursor, or None when the current page is final."""
+        page = (data or {}).get("page") or {}
+        return page.get("next_cursor") if page.get("has_more") else None
+
+    # Return every library visible to the current profile. API pagination is hidden from Kodi.
+    def libraries(self):
+        libraries = []
+        cursor = None
+
+        while True:
+            data = self._json(
+                "GET",
+                "/api/v2/user/libraries",
+                params={"cursor": cursor} if cursor else None,
+            ) or {}
+
+            libraries.extend(data.get("items", []))
+
+            cursor = self._next(data)
+            if not cursor:
+                return libraries
+
+    # Return the profile-wide Home sections. These combine content across
+    # all libraries visible to the selected profile.
+    def home_sections(self, image_size="medium"):
+        data = self._json(
+            "GET",
+            "/api/v2/home/sections",
+            params={"image_size": image_size},
+        ) or {}
+        return data.get("sections", [])
+
+    # Return one profile-wide Home section and its cards.
+    def home_section_items(self, section_id, image_size="medium"):
+        data = self._json(
+            "GET",
+            "/api/v2/home/sections/%s/items"
+            % quote(str(section_id), safe=""),
+            params={"image_size": image_size},
+        ) or {}
+        return data
+
+    # Return one Home section through Silo's full catalog-card endpoint.
+    # Unlike /home/sections/{id}/items, this response uses CatalogItem and
+    # includes added_at. For Recently Added TV sections, Silo's resolver sets
+    # that timestamp to the episode/event that caused the series to be recent.
+    def home_section_catalog_items(self, section_id, image_size="medium", limit=200):
+        """Return full catalog cards for one profile-scoped Home section."""
+        try:
+            limit = max(1, min(int(limit or 200), 200))
+        except (TypeError, ValueError):
+            limit = 200
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog",
+            params={
+                "source": "section",
+                "scope": "home",
+                "section_id": section_id,
+                "limit": limit,
+                "skip_total": "true",
+                "image_size": image_size,
+            },
+        ) or {}
+
+        # The stable v2 catalog response is normally the collection itself.
+        # Accept a body envelope as well for compatibility with older builds.
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+
+        return data
+
+    # Return the profile-scoped recommendation rows shown on Silo Discover.
+    def discover_sections(self, image_size="medium"):
+        data = self._json(
+            "GET",
+            "/api/v2/recommendations/discover",
+            params={"image_size": image_size},
+        ) or {}
+
+        # V2 normally returns a collection with items; accept the older rows
+        # envelope too so the client remains tolerant of server versions.
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        if not isinstance(data, dict):
+            return []
+
+        rows = data.get("items") or data.get("rows") or []
+        return rows if isinstance(rows, list) else []
+
+    # Return the complete contents of one Discover row where the server
+    # exposes a dedicated section route.
+    def recommendation_section(self, kind, key=None, image_size="medium", limit=60):
+        kind = str(kind or "").strip()
+        if not kind:
+            return {}
+
+        try:
+            limit = max(1, min(int(limit or 60), 60))
+        except (TypeError, ValueError):
+            limit = 60
+
+        params = {
+            "limit": limit,
+            "image_size": image_size,
+        }
+        if key not in (None, ""):
+            params["key"] = str(key)
+
+        data = self._json(
+            "GET",
+            "/api/v2/recommendations/section/%s" % quote(kind, safe=""),
+            params=params,
+        ) or {}
+
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
+    def catalog_search_capabilities(self):
+        """Read optional catalog features supported by this server."""
+        if self._catalog_search_caps is not None:
+            return self._catalog_search_caps
+
+        try:
+            data = self._json(
+                "GET",
+                "/api/v2/catalog/search/capabilities",
+            ) or {}
+        except SiloError as exc:
+            if exc.status in (404, 501):
+                log(
+                    "Catalog search capabilities are unavailable on this server: %s" % exc,
+                    xbmc.LOGDEBUG,
+                )
+                self._catalog_search_caps = {}
+                return self._catalog_search_caps
+            raise
+
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        self._catalog_search_caps = data if isinstance(data, dict) else {}
+        return self._catalog_search_caps
+
+    def search_box_sets(self, query, limit=5):
+        """Search viewer-visible TMDB Box Sets when the server advertises support."""
+        query = str(query or "").strip()
+        if not query or self.catalog_search_capabilities().get("box_sets") is not True:
+            return []
+
+        try:
+            limit = max(1, min(int(limit or 5), 20))
+        except (TypeError, ValueError):
+            limit = 5
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/box-sets",
+            params={"q": query, "limit": limit},
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        if not isinstance(data, dict):
+            return []
+        items = data.get("items") or []
+        return items if isinstance(items, list) else []
+
+    def item_box_set(self, content_id, library_id):
+        """Retrieve the box set associated with one movie, if it has one."""
+        content_id = str(content_id or "").strip()
+        library_id = str(library_id or "").strip()
+        if not content_id or not library_id:
+            raise SiloError("A content ID and library ID are required.")
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/items/%s/box-set" % quote(content_id, safe=""),
+            params={"library_id": library_id, "image_size": "medium"},
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
+    def box_set(self, collection_id, library_id):
+        """Retrieve one TMDB Box Set and its accessible movies in release order."""
+        collection_id = str(collection_id or "").strip()
+        library_id = str(library_id or "").strip()
+        if not collection_id or not library_id:
+            raise SiloError("A Box Set ID and library ID are required.")
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/box-sets/%s" % quote(collection_id, safe=""),
+            params={"library_id": library_id, "image_size": "medium"},
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
+    # Search the profile-visible catalog across all accessible libraries.
+    # Silo performs the search server-side, so the addon does not need to
+    # download and scan every library itself.
+    def search_people(self, query, limit=20):
+        """Search profile-visible Silo people by name."""
+        query = str(query or "").strip()
+        if not query:
+            return []
+
+        try:
+            limit = max(1, min(int(limit or 20), 100))
+        except (TypeError, ValueError):
+            limit = 20
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/people",
+            params={
+                "q": query,
+                "limit": limit,
+            },
+        ) or {}
+
+        return data.get("items", [])
+
+    def person_catalog_page(self, person_id, cursor=None, limit=200):
+        """Return one page of profile-visible media credited to a person."""
+        person_id = str(person_id or "").strip()
+        if not person_id:
+            return [], None
+
+        limit = max(1, min(int(limit or 200), 200))
+
+        params = {
+            "source": "person",
+            "person_id": person_id,
+            "limit": limit,
+            "skip_total": "true",
+            "image_size": "medium",
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog",
+            params=params,
+        ) or {}
+
+        return (
+            data.get("items", []),
+            self._next(data),
+        )
+
+    def search_catalog(self, query, limit=100, offset=0):
+        """Return one page of Silo's v2 server-side catalog search results.
+
+        Keep the add-on's existing page/offset interface, but translate the
+        offset into Silo v2's explicit zero-based seek. The v2 catalog already
+        supplies the same profile-scoped search results plus cursor metadata,
+        so no v1 compatibility endpoint is needed.
+        """
+        query = str(query or "").strip()
+        if not query:
+            return {"items": [], "has_more": False, "total": 0}
+
+        try:
+            limit = max(1, min(int(limit or 100), 100))
+        except (TypeError, ValueError):
+            limit = 100
+
+        try:
+            offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            offset = 0
+
+        params = {
+            "source": "query",
+            "q": query,
+            "limit": limit,
+            "skip_total": "true",
+            "image_size": "medium",
+        }
+
+        # Silo v2 uses seek for a direct jump to the requested zero-based
+        # result window. Page 1 naturally starts at position zero, so omit it.
+        if offset:
+            params["seek"] = offset
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog",
+            params=params,
+        ) or {}
+
+        page = data.get("page") or {}
+
+        return {
+            "items": data.get("items") or [],
+            "has_more": bool(page.get("has_more")),
+            "total": data.get("total", 0),
+            "total_exact": bool(data.get("total_exact", False)),
+            "next_cursor": page.get("next_cursor"),
+            "window_cursor": data.get("window_cursor"),
+        }
+
+    # Join an existing Watch Party. Kodi intentionally exposes no
+    # room-creation operation: this client is participant-only.
+    def watch_party_join(self, code=None, join_token=None):
+        body = {}
+
+        if str(code or "").strip():
+            body["code"] = str(code).strip().upper()
+
+        if str(join_token or "").strip():
+            body["join_token"] = str(join_token).strip()
+
+        if not body:
+            raise SiloError("A Watch Party code or invite token is required.")
+
+        return self._json(
+            "POST",
+            "/api/v2/watch-together/join",
+            body=body,
+        ) or {}
+
+    # Mint a single-use room socket ticket. The original room proof remains in
+    # X-Room-Token; Silo does not accept room credentials in the WebSocket URL.
+    def watch_party_socket_ticket(self, room_id, room_token):
+        if not room_id or not room_token:
+            raise SiloError("Watch Party room credentials are missing.")
+
+        data = self._json(
+            "POST",
+            "/api/v2/watch-together/rooms/%s/ws-ticket"
+            % quote(str(room_id), safe=""),
+            extra_headers={
+                "X-Room-Token": str(room_token),
+            },
+        ) or {}
+
+        protocol = str(data.get("protocol") or "")
+        ticket = str(data.get("ticket") or "")
+
+        if protocol != "silo.room.v2" or len(ticket) != 43:
+            raise SiloError("Silo returned an invalid Watch Party socket credential.")
+
+        return data
+
+    # Return one page from a profile-wide personal catalog source.
+    # This is the same catalog surface the Silo web client uses for Favorites,
+    # Watchlist and History, preserving the server's source ordering and cursor.
+    def personal_catalog_page(self, source, cursor=None, limit=200, collection_id=None):
+        source = str(source or "").strip().lower()
+        if source not in ("favorites", "watchlist", "history", "user_collection"):
+            raise SiloError("Unsupported personal catalog source: %s" % source)
+
+        limit = max(1, min(int(limit or 200), 200))
+
+        params = {
+            "source": source,
+            "limit": limit,
+            "skip_total": "true",
+            "image_size": "medium",
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        if collection_id:
+            params["collection_id"] = collection_id
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog",
+            params=params,
+        ) or {}
+
+        return (
+            data.get("items", []),
+            self._next(data),
+        )
+
+    # Return the profile's visible personal collections and collection groups.
+    def set_watchlist(self, content_id, enabled=True):
+        """Add or remove a title from the active profile's Watchlist."""
+        item_id = quote(str(content_id or ""), safe="")
+        if not item_id:
+            raise SiloError("No content ID was supplied.")
+        return self._json(
+            "PUT" if enabled else "DELETE",
+            "/api/v2/watchlist/%s" % item_id,
+        )
+
+    def set_favorite(self, content_id, enabled=True):
+        """Add or remove a title from the active profile's Favorites."""
+        item_id = quote(str(content_id or ""), safe="")
+        if not item_id:
+            raise SiloError("No content ID was supplied.")
+        return self._json(
+            "PUT" if enabled else "DELETE",
+            "/api/v2/favorites/%s" % item_id,
+        )
+
+    def set_watched(self, content_id, enabled=True):
+        """Mark a title watched or unwatched on the active profile."""
+        item_id = quote(str(content_id or ""), safe="")
+        if not item_id:
+            raise SiloError("No content ID was supplied.")
+        return self._json(
+            "POST" if enabled else "DELETE",
+            "/api/v2/watched/%s" % item_id,
+        )
+
+    def collections(self):
+        data = self._json(
+            "GET",
+            "/api/v2/collections",
+        ) or {}
+
+        return (
+            data.get("items", []),
+            data.get("groups", []),
+        )
+
+    # Return every catalog item in a library while handling pagination internally.
+    # Silo's current API documents a maximum catalog page size of 200, so use
+    # that maximum to reduce the number of HTTP round trips for large libraries.
+    def catalog_page(self, library_id, cursor=None, limit=200,
+                     name_prefix=None, sort=None, seek=None):
+        """Return one Silo catalog page and its continuation cursor."""
+        limit = max(1, min(int(limit or 200), 200))
+
+        params = {
+            "library_id": library_id,
+            "limit": limit,
+            "skip_total": "true",
+            "image_size": "medium",
+        }
+        if name_prefix:
+            params["name_prefix"] = str(name_prefix)
+        if sort:
+            params["sort"] = str(sort)
+        if seek is not None:
+            try:
+                params["seek"] = max(0, int(seek))
+            except (TypeError, ValueError):
+                params["seek"] = 0
+        if cursor:
+            params["cursor"] = cursor
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog",
+            params=params,
+        ) or {}
+
+        return (
+            data.get("items", []),
+            self._next(data),
+        )
+
+    # Return one server-side alphabet page and its total/has-more information.
+    def catalog_prefix_page(self, library_id, name_prefix, offset=0,
+                            limit=200, include_total=False):
+        """Return one indexed title-prefix page using Silo's seek support."""
+        prefix = str(name_prefix or "").strip()
+        if not prefix:
+            return [], 0, False, False
+
+        try:
+            offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            offset = 0
+
+        limit = max(1, min(int(limit or 200), 200))
+
+        params = {
+            "library_id": library_id,
+            "limit": limit,
+            "skip_total": "false" if include_total else "true",
+            "image_size": "medium",
+            "name_prefix": prefix,
+            "sort": "title",
+            "seek": offset,
+        }
+        data = self._json(
+            "GET",
+            "/api/v2/catalog",
+            params=params,
+        ) or {}
+
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+
+        total_exact = bool(data.get("total_exact"))
+        page = data.get("page") or {}
+
+        return (
+            data.get("items", []),
+            total,
+            total_exact,
+            bool(page.get("has_more")),
+        )
+
+
+    def catalog(self, library_id, limit=200):
+        items = []
+        cursor = None
+
+        while True:
+            page_items, cursor = self.catalog_page(
+                library_id,
+                cursor=cursor,
+                limit=limit,
+            )
+
+            items.extend(page_items)
+
+            if not cursor:
+                return items
+
+    # Return all seasons for a series.
+    def seasons(self, series_id, library_id=None, suppress_not_found=False):
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/series/%s/seasons" % quote(series_id, safe=":"),
+            params={"library_id": library_id} if library_id else None,
+            log_not_found=not suppress_not_found,
+        ) or {}
+
+        return data.get("items", [])
+
+    # Return all episodes for one series season.
+    def episodes(self, series_id, season_number, library_id=None):
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/series/%s/seasons/%s/episodes"
+            % (quote(series_id, safe=":"), season_number),
+            params={"library_id": library_id} if library_id else None,
+        ) or {}
+
+        return data.get("items", [])
+
+    # Return the complete detail document for one catalog item.
+    #
+    # Unlike the browse/catalog card, this endpoint includes cast, crew and
+    # full file-version track metadata. Results are cached for the lifetime of
+    # this Kodi directory request so play() can reuse the same detail document.
+    def item_detail(self, content_id, library_id=None, file_id=None):
+        key = (
+            str(content_id),
+            str(library_id) if library_id is not None else "",
+            str(file_id) if file_id is not None else "",
+        )
+
+        if key in self._details:
+            return self._details[key]
+        # The detail endpoint also prepares cast/crew artwork. Kodi only        # needs small thumbnails for these person images, which keeps the
+        # metadata response substantially smaller for large libraries.
+        params = {"image_size": "small"}
+
+        if library_id:
+            params["library_id"] = library_id
+        if file_id:
+            params["file_id"] = file_id
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/items/%s" % quote(content_id, safe=":"),
+            params=params or None,
+        ) or {}
+
+        self._details[key] = data
+        return data
+
+    # Return the playable versions/files for one catalog item.
+    def versions(self, content_id, library_id=None):
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/items/%s/versions" % quote(content_id, safe=":"),
+            params={"library_id": library_id} if library_id else None,
+        ) or {}
+
+        return data.get("items", [])
+
+    # ------------------------------------------------------------ progress
+
+    # Retrieve every server-side progress record, hiding pagination from Kodi.
+    def progress(self, library_id=None, status=None):
+        records = []
+        cursor = None
+
+        while True:
+            # The current Silo progress endpoint supports up to 200 records
+            # per page, which reduces round trips when the fresh playback check
+            # scans the server's progress collection.
+            params = {"limit": 200}
+
+            if library_id:
+                params["library_id"] = library_id
+
+            if status:
+                params["status"] = status
+
+            if cursor:
+                params["cursor"] = cursor
+
+            data = self._json(
+                "GET",
+                "/api/v2/progress",
+                params=params,
+            ) or {}
+
+            records.extend(data.get("items", []))
+
+            cursor = self._next(data)
+            if not cursor:
+                return records
+
+    # Return only in-progress records for a library.
+    #
+    # The catalog already tells us which items are fully played. To display
+    # accurate partial-watch markers we only need the smaller in_progress subset
+    # rather than downloading the entire progress history.
+    def in_progress(self, library_id=None):
+        return self.progress(
+            library_id=library_id,
+            status="in_progress",
+        )
+
+    # Build a lookup map containing the newest in-progress record for each item.
+    def in_progress_map(self, library_id=None):
+        result = {}
+
+        for record in self.in_progress(library_id=library_id):
+            media_id = record.get("media_item_id")
+            if media_id is None:
+                continue
+
+            key = str(media_id)
+            existing = result.get(key)
+
+            if (
+                not existing
+                or (record.get("updated_at") or "")
+                > (existing.get("updated_at") or "")
+            ):
+                result[key] = record
+
+        return result
+
+    # Return the newest Silo progress record for one catalog media item.
+    def get_progress(self, content_id, library_id=None):
+        matches = [
+            record
+            for record in self.progress(library_id=library_id)
+            if str(record.get("media_item_id")) == str(content_id)
+        ]
+
+        if not matches:
+            return None
+
+        # Silo returns newest-change-first, but sorting explicitly means this
+        # method remains correct even if the API ordering changes later.
+        matches.sort(
+            key=lambda record: record.get("updated_at") or "",
+            reverse=True,
+        )
+
+        return matches[0]
+
+    # Build a single lookup map containing the newest record for each media item.
+    def progress_map(self, library_id=None):
+        result = {}
+
+        for record in self.progress(library_id=library_id):
+            media_id = record.get("media_item_id")
+            if media_id is None:
+                continue
+
+            key = str(media_id)
+            existing = result.get(key)
+
+            if not existing or (record.get("updated_at") or "") > (existing.get("updated_at") or ""):
+                result[key] = record
+
+        return result
+
+    # ------------------------------------------------------------ playback
+
+    # Fetch and cache the playback capabilities advertised by Silo.
+    def playback_caps(self):
+        if self._caps is None:
+            self._caps = self._json(
+                "GET",
+                "/api/v2/playback/capabilities",
+                need_profile=False,
+            ) or {}
+
+        return self._caps
+
+    # Identify this Kodi installation in playback requests.
+    def _installation_id(self):
+        return self.playback_caps().get("installation_id") or self.cfg["device_id"]
+
+    # Pick the highest protocol version supported by both the server metadata and our fallback.
+    def _protocol_version(self):
+        versions = self.playback_caps().get("protocol_versions") or [3]
+
+        try:
+            return max(int(version) for version in versions)
+        except (TypeError, ValueError):
+            return 3
+
+    # Read a previously measured bandwidth value for this server, if it is fresh.
+    def _bandwidth_cache_record(self):
+        raw = _setting("bandwidth_estimate_cache")
+        try:
+            record = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+        if not isinstance(record, dict) or record.get("server") != self.base:
+            return None
+
+        try:
+            measured_at = float(record.get("measured_at"))
+        except (TypeError, ValueError):
+            return None
+
+        age = time.time() - measured_at
+        if age < 0:
+            return None
+
+        record["_age_seconds"] = age
+        return record
+
+    def cached_bandwidth_estimate_kbps(self):
+        """Return a fresh measured value, never a recipe-derived guess."""
+        record = self._bandwidth_cache_record()
+        if not record or record.get("_age_seconds", float("inf")) > 1800:
+            return None
+
+        try:
+            kbps = int(record.get("kbps"))
+        except (TypeError, ValueError):
+            return None
+
+        return max(100, min(kbps, 1000000)) if kbps >= 100 else None
+
+    def _store_bandwidth_probe_result(self, kbps):
+        record = {
+            "server": self.base,
+            "measured_at": time.time(),
+            "kbps": int(kbps) if kbps is not None else None,
+        }
+        value = json.dumps(record, separators=(",", ":"))
+        self.cfg["bandwidth_estimate_cache"] = value
+        _set_setting("bandwidth_estimate_cache", value)
+
+    def measure_bandwidth_kbps(self):
+        """Measure throughput using Silo's advertised, rate-limited probe API.
+
+        The result is cached for 30 minutes. Failed probes are briefly cached too,
+        avoiding repeated requests if the endpoint is temporarily unavailable.
+        """
+        caps = self.playback_caps()
+        features = caps.get("features") or []
+        if "bandwidth_probe_v1" not in features:
+            return None
+
+        cached = self._bandwidth_cache_record()
+        if cached:
+            age = cached.get("_age_seconds", float("inf"))
+            if age <= 1800:
+                try:
+                    kbps = int(cached.get("kbps"))
+                    if kbps >= 100:
+                        return min(kbps, 1000000)
+                except (TypeError, ValueError):
+                    # A cached failed attempt is retried after a short cooldown.
+                    if "kbps" in cached and cached.get("kbps") is None and age < 300:
+                        return None
+
+        response = None
+        started = None
+        warm = None
+        bytes_received = 0
+        now = None
+        try:
+            response = self._send(
+                "GET",
+                "/api/v2/playback/bandwidth-probe",
+                params={"size": 40000000},
+                need_profile=False,
+                timeout=(5, 2),
+                extra_headers={"Accept": "application/octet-stream"},
+                stream=True,
+            )
+
+            # Match the server web client's probe window: ignore the first chunk
+            # for connection ramp-up, then time at most two seconds of traffic.
+            for chunk in response.iter_content(chunk_size=8 * 1024):
+                if not chunk:
+                    continue
+                now = time.monotonic()
+                if started is None:
+                    started = now
+                    continue
+
+                bytes_received += len(chunk)
+                elapsed = now - started
+                if warm is None and elapsed >= 0.3:
+                    warm = (now, bytes_received)
+                if elapsed >= 2.0:
+                    break
+        except (requests.RequestException, SiloError, ValueError, OSError) as exc:
+            log("Bandwidth probe unavailable; Auto will use best-effort source quality: %s" % exc, xbmc.LOGDEBUG)
+            self._store_bandwidth_probe_result(None)
+            return None
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+        if started is None or now is None:
+            self._store_bandwidth_probe_result(None)
+            return None
+
+        elapsed = now - started
+        if elapsed <= 0 or (elapsed < 0.2 and bytes_received < 1000000):
+            self._store_bandwidth_probe_result(None)
+            return None
+
+        if warm and now - warm[0] >= warm[0] - started and bytes_received > warm[1]:
+            kbps = int(((bytes_received - warm[1]) * 8) / ((now - warm[0]) * 1000))
+        else:
+            kbps = int((bytes_received * 8) / (elapsed * 1000))
+
+        if kbps < 100:
+            self._store_bandwidth_probe_result(None)
+            return None
+
+        kbps = min(kbps, 1000000)
+        self._store_bandwidth_probe_result(kbps)
+        log("Measured server bandwidth: %d kbps (cached for 30 minutes)." % kbps, xbmc.LOGDEBUG)
+        return kbps
+
+
+    # Build a protocol-v3 playback/start request.
+    def _start_body(self, file_id, start_position=0.0, quality_preference="auto", direct_play_only=False):
+        caps = self.playback_caps()
+        pv = self._protocol_version()
+        output_hdr_details = _kodi_output_hdr_details()
+        quality_preference = str(quality_preference or "auto").strip()
+        if quality_preference.lower() == "original":
+            # The current API retains original only as a deprecated alias.
+            quality_preference = "auto"
+
+        # JellyCon deliberately does not restrict DirectPlayProfiles by codec,
+        # container, resolution or decoder. Silo's current v3 planner requires
+        # non-empty flat capability lists for its direct-play eligibility gate,
+        # so use a broad Kodi software-playback vocabulary here rather than
+        # attempting to guess the capabilities of the current hardware.
+        #
+        # These are compatibility declarations, not hardware-acceleration
+        # claims. Direct playback remains preferred by Silo whenever the source
+        # matches these broad capabilities; otherwise Silo can fall through to
+        # remux/transcode.
+        video = [
+            "h264",
+            "hevc",
+            "vp9",
+            "av1",
+            "mpeg2video",
+            "mpeg4",
+            "vc1",
+        ]
+        audio = [
+            "aac",
+            "ac3",
+            "eac3",
+            "dts",
+            "truehd",
+            "flac",
+            "opus",
+            "mp3",
+            "vorbis",
+            "pcm",
+        ]
+        containers = [
+            "mkv",
+            "mp4",
+            "avi",
+            "ts",
+            "webm",
+            "mov",
+        ]
+
+        delivery_template = {
+            "enabled": True,
+            "supported_on_device": True,
+            "containers": containers,
+            "video_codecs": video,
+            "audio_decode_codecs": audio,
+            "audio_passthrough_codecs": [],
+            "subtitles": {
+                "embedded_text": True,
+                "sidecar_text": True,
+                "ass_styling": True,
+                "embedded_bitmap": True,
+                "sidecar_bitmap": True,
+                "font_attachments": True,
+            },
+            "features": [],
+            "auth_header_refresh": False,
+            "validated_claims": [],
+            "transformations": [],
+        }
+
+        # Preserve the server-advertised delivery objects where available.
+        # Silo maps its server delivery names to these client classes:
+        # original_http, progressive and hls.
+        server_deliveries = caps.get("deliveries") or {}
+
+        if isinstance(server_deliveries, dict):
+            deliveries = {
+                name: dict(value)
+                if isinstance(value, dict)
+                else dict(delivery_template)
+                for name, value in server_deliveries.items()
+            }
+        else:
+            deliveries = {
+                name: dict(delivery_template)
+                for name in server_deliveries
+            }
+
+        # Direct-play classes use the broad compatibility declaration above.
+        original_delivery = deliveries.get(
+            "original_http",
+            dict(delivery_template),
+        )
+        original_delivery.update(delivery_template)
+        deliveries["original_http"] = original_delivery
+
+        progressive_delivery = deliveries.get(
+            "progressive",
+            dict(delivery_template),
+        )
+        progressive_delivery.update(delivery_template)
+        deliveries["progressive"] = progressive_delivery
+
+        # HLS is only the fallback/transcode path. Silo's validated HLS
+        # transcode recipe produces H.264 video and AAC audio.
+        hls_delivery = deliveries.get(
+            "hls",
+            dict(delivery_template),
+        )
+        hls_delivery["containers"] = ["hls"]
+        hls_delivery["video_codecs"] = ["h264"]
+        hls_delivery["audio_decode_codecs"] = ["aac"]
+        hls_delivery["audio_passthrough_codecs"] = []
+        deliveries["hls"] = hls_delivery
+
+        # These declarations are about what the active output can display,
+        # not what the server can encode. Replace any generic/server-default
+        # HDR details with Kodi's display report for the source-preserving
+        # original and progressive routes. When Kodi cannot report them, omit
+        # the claims rather than borrowing unrelated capability data.
+        for delivery in (original_delivery, progressive_delivery, hls_delivery):
+            if output_hdr_details is None:
+                delivery.pop("hdr_details", None)
+            else:
+                delivery["hdr_details"] = dict(output_hdr_details)
+
+        if direct_play_only:
+            # In direct-play-only mode, tell Silo that transcoding/remux-style
+            # delivery is not an acceptable fallback. The returned plan is
+            # still validated below, so this remains fail-closed if a server
+            # ignores or does not understand the delivery declaration.
+            original_delivery["enabled"] = True
+            original_delivery["supported_on_device"] = True
+            progressive_delivery["enabled"] = False
+            progressive_delivery["supported_on_device"] = False
+            hls_delivery["enabled"] = False
+            hls_delivery["supported_on_device"] = False
+
+        supported_features = set(caps.get("features") or [])
+        client_features = ["playback_plan_v3", "seek_reanchor_v1"]
+        # Kodi's native player can consume the HLS SUBTITLES group. Add the
+        # optional rendition features only when this server advertises them.
+        if "hls_subtitle_renditions_v1" in supported_features:
+            client_features.append("hls_subtitle_renditions_v1")
+            if "hls_remux_subtitle_renditions_v1" in supported_features:
+                client_features.append("hls_remux_subtitle_renditions_v1")
+            if "hls_subtitle_renditions_all_v1" in supported_features:
+                client_features.append("hls_subtitle_renditions_all_v1")
+
+        body = {
+            "installation_id": self._installation_id(),
+            "protocol_version": pv,
+            "client_features": client_features,
+            "file_id": str(file_id),
+            "profile_id": str(self.cfg["profile_id"]),
+            "start_position": float(start_position),
+            "playback_attempt_id": uuid.uuid4().hex,
+            "quality_preference": quality_preference,
+            "subtitle_fidelity_preference": "preserve",
+            "metered": False,
+            "progress_persistence": "server",
+            "client_capabilities": {
+                "video_evidence": "declared",
+                "audio_evidence": "declared",
+                "codecs_video": video,
+                "codecs_video_hardware": [],
+                "codecs_audio": audio,
+                "containers": containers,
+                # The generic decoder-level HDR flag is not a display report.
+                # The current output's supported formats are sent separately below.
+                "hdr": True,
+            },
+            "client_playback_context": {
+                "protocol_version": pv,
+                "form_factor": "desktop",
+                "app_version": ADDON_VERSION,
+                "device": {
+                    "platform": "kodi",
+                    "manufacturer": "",
+                    "model": "",
+                    "os_version": xbmc.getInfoLabel("System.OSVersionInfo"),
+                },
+                "output": (
+                    {"hdr_details": dict(output_hdr_details)}
+                    if output_hdr_details is not None
+                    else {}
+                ),
+                "deliveries": deliveries,
+            },
+        }
+
+        # A measured probe is cached between playback starts. Never synthesize a
+        # throughput estimate from the media recipe: Auto treats this field as a
+        # measurement when deciding whether it can safely use the source bitrate.
+        if not direct_play_only:
+            estimate = self.measure_bandwidth_kbps()
+            if estimate is not None:
+                body["bandwidth_estimate_kbps"] = estimate
+
+        return body
+
+
+    # Replan an active session when the player reports sustained network trouble.
+
+    # Silo owns the quality decision; Kodi only supplies the current position and
+
+    # an observed effective bandwidth estimate.
+
+    def replan_playback(self, info, position, bandwidth_estimate_kbps=None, quality_preference="auto", operation="failure_recovery", failure=None):
+
+        plan = (info or {}).get("playback_plan") or {}
+        session_id = (info or {}).get("session_id") or plan.get("session_id")
+
+        if not session_id or not plan:
+            raise SiloError("Cannot replan playback without an active Silo plan.")
+
+        quality_preference = str(quality_preference or "auto").strip()
+        if quality_preference.lower() == "original":
+            quality_preference = "auto"
+
+        if bandwidth_estimate_kbps is not None:
+            try:
+                bandwidth_estimate_kbps = int(bandwidth_estimate_kbps)
+            except (TypeError, ValueError):
+                raise SiloError("Invalid bandwidth estimate for playback replan.")
+            bandwidth_estimate_kbps = max(100, min(bandwidth_estimate_kbps, 1000000))
+        elif quality_preference == "auto":
+            # Reuse only a still-fresh measured result; do not run a probe while
+            # playback is active because the extra transfer competes with media.
+            bandwidth_estimate_kbps = self.cached_bandwidth_estimate_kbps()
+
+        playback_attempt_id = str((info or {}).get("playback_attempt_id") or "")
+        plan_attempt_id = str((info or {}).get("plan_attempt_id") or "")
+
+        if not playback_attempt_id or not plan_attempt_id:
+            raise SiloError("Playback replan state is incomplete.")
+
+        current_plan_key = str(plan.get("plan_attempt_key") or "")
+
+        # Failure recovery uses attempted-plan loop prevention. Explicit
+        # quality changes are a fresh intent and must start a new replan chain.
+        is_failure_recovery = str(operation or "failure_recovery") in (
+            "failure_recovery",
+            "seek_failure_recovery",
+        )
+
+        if is_failure_recovery:
+            attempted_plan_keys = list((info or {}).get("attempted_plan_keys") or [])
+            if current_plan_key and current_plan_key not in attempted_plan_keys:
+                attempted_plan_keys.append(current_plan_key)
+            attempted_plan_keys = attempted_plan_keys[-16:]
+
+            try:
+                attempt_count = int((info or {}).get("attempt_count") or 1) + 1
+            except (TypeError, ValueError):
+                attempt_count = 2
+
+            attempt_count = max(1, min(attempt_count, 8))
+        else:
+            attempted_plan_keys = []
+            attempt_count = 1
+
+        # Silo requires every failure_recovery replan to carry a failure
+        # classification. Enforce that here as a final safeguard so callers
+        # cannot accidentally produce a malformed recovery request.
+        if str(operation or "failure_recovery") in (
+            "failure_recovery",
+            "seek_failure_recovery",
+        ) and not failure:
+            failure = {
+                "classification": "playback_recovery",
+                "message": "Kodi requested recovery from the current playback plan.",
+            }
+
+        body = {
+            "installation_id": self._installation_id(),
+            "protocol_version": 3,
+            "client_features": list(
+                (info or {}).get("client_features") or ["playback_plan_v3", "seek_reanchor_v1"]
+            ),
+            "operation": str(operation or "failure_recovery"),
+            "playback_attempt_id": playback_attempt_id,
+            "replan_request_id": uuid.uuid4().hex,
+            "failed_plan_id": str(plan.get("plan_id") or ""),
+            "plan_attempt_id": plan_attempt_id,
+            "plan_attempt_key": current_plan_key,
+            "attempted_plan_keys": attempted_plan_keys,
+            "attempt_count": attempt_count,
+            "quality_preference": quality_preference,
+            "position_seconds": max(0.0, float(position or 0.0)),
+            "metered": bool((info or {}).get("metered", False)),
+            "selected_tracks": plan.get("selected_tracks") or {},
+            "client_capabilities": (info or {}).get("client_capabilities") or {},
+            "client_playback_context": (info or {}).get("client_playback_context") or {},
+            **({"failure": failure} if failure else {}),
+        }
+
+        if bandwidth_estimate_kbps is not None:
+            body["bandwidth_estimate_kbps"] = bandwidth_estimate_kbps
+
+        data = self._json(
+            "POST",
+            "/api/v2/playback/%s/replan" % session_id,
+            body=body,
+            timeout=90,
+        ) or {}
+
+        new_plan = data.get("playback_plan")
+        if not new_plan:
+            terminal = data.get("terminal") or data.get("outcome")
+            raise SiloError(
+                "Silo could not adapt playback: %s" % json.dumps(terminal)[:400],
+                problem=terminal if isinstance(terminal, dict) else {},
+            )
+
+        stream = new_plan.get("stream") or {}
+        url = self.abs_url(stream.get("url"))
+
+        if not url:
+            raise SiloError("Silo returned an adaptive plan without a stream URL.")
+
+        headers = dict(stream.get("headers") or {})
+        auth_headers = self._headers()
+
+        for key in ("Authorization", "X-Profile-Id", "X-Profile-Token"):
+            value = auth_headers.get(key)
+            if value and key not in headers:
+                headers[key] = value
+
+        if headers:
+            url += "|" + "&".join(
+                "%s=%s" % (key, quote(str(value), safe=""))
+                for key, value in headers.items()
+            )
+
+        log(
+            "adaptive replan delivery=%s quality=%s bandwidth_estimate_kbps=%s position=%.3f"
+            % (
+                new_plan.get("delivery"),
+                quality_preference or "auto",
+                bandwidth_estimate_kbps if bandwidth_estimate_kbps is not None else "omitted",
+                float(position or 0.0),
+            )
+        )
+
+        return {
+            "url": url,
+            "session_id": data.get("session_id") or session_id,
+            "playback_plan": new_plan,
+            "playback_attempt_id": playback_attempt_id,
+            "client_features": body.get("client_features") or [],
+            "quality_preference": quality_preference,
+            "plan_attempt_id": plan_attempt_id,
+            "attempted_plan_keys": attempted_plan_keys,
+            "attempt_count": attempt_count,
+            "metered": bool((info or {}).get("metered", False)),
+            "client_capabilities": (info or {}).get("client_capabilities") or {},
+            "client_playback_context": (info or {}).get("client_playback_context") or {},
+        }
+
+    # Reopen the current transport with fresh authentication at the same
+    # playback position. The seek_reanchor operation preserves the selected
+    # media version, tracks, quality and route semantics while issuing a new
+    # stream URL containing the current access token.
+    def refresh_playback_stream_auth(self, info, position):
+        plan = (info or {}).get("playback_plan") or {}
+        session_id = (info or {}).get("session_id") or plan.get("session_id")
+
+        if not session_id or not plan:
+            raise SiloError("Cannot refresh playback authentication without an active Silo plan.")
+
+        playback_attempt_id = str((info or {}).get("playback_attempt_id") or "")
+        plan_attempt_id = str((info or {}).get("plan_attempt_id") or "")
+        plan_attempt_key = str(plan.get("plan_attempt_key") or "")
+
+        if not playback_attempt_id or not plan_attempt_id or not plan_attempt_key:
+            raise SiloError("Playback reauthentication state is incomplete.")
+
+        quality_preference = str(
+            (info or {}).get("quality_preference")
+            or plan.get("quality_preference")
+            or "auto"
+        ).strip()
+        if quality_preference.lower() == "original":
+            quality_preference = "auto"
+
+        body = {
+            "installation_id": self._installation_id(),
+            "protocol_version": 3,
+            "client_features": list(
+                (info or {}).get("client_features") or ["playback_plan_v3", "seek_reanchor_v1"]
+            ),
+            "operation": "seek_reanchor",
+            "playback_attempt_id": playback_attempt_id,
+            "replan_request_id": str(uuid.uuid4()),
+            "failed_plan_id": str(plan.get("plan_id") or ""),
+            "plan_attempt_id": plan_attempt_id,
+            "plan_attempt_key": plan_attempt_key,
+            "attempted_plan_keys": [],
+            "attempt_count": 1,
+            "quality_preference": quality_preference,
+            "position_seconds": max(0.0, float(position or 0.0)),
+            "metered": bool((info or {}).get("metered", False)),
+            "selected_tracks": plan.get("selected_tracks") or {},
+            "client_capabilities": (info or {}).get("client_capabilities") or {},
+            "client_playback_context": (info or {}).get("client_playback_context") or {},
+        }
+
+        if quality_preference == "auto":
+            estimate = self.cached_bandwidth_estimate_kbps()
+            if estimate is not None:
+                body["bandwidth_estimate_kbps"] = estimate
+
+        data = self._json(
+            "POST",
+            "/api/v2/playback/%s/replan" % session_id,
+            body=body,
+            timeout=90,
+        ) or {}
+
+        new_plan = data.get("playback_plan")
+        if not new_plan:
+            terminal = data.get("terminal") or data.get("outcome")
+            raise SiloError(
+                "Silo could not refresh the playback stream: %s" % json.dumps(terminal)[:400],
+                problem=terminal if isinstance(terminal, dict) else {},
+            )
+
+        stream = new_plan.get("stream") or {}
+        url = self.abs_url(stream.get("url"))
+        if not url:
+            raise SiloError("Silo returned a refreshed playback plan without a stream URL.")
+
+        headers = dict(stream.get("headers") or {})
+        auth_headers = self._headers()
+        for key in ("Authorization", "X-Profile-Id", "X-Profile-Token"):
+            value = auth_headers.get(key)
+            if value and key not in headers:
+                headers[key] = value
+
+        if headers:
+            url += "|" + "&".join(
+                "%s=%s" % (key, quote(str(value), safe=""))
+                for key, value in headers.items()
+            )
+
+        return {
+            "url": url,
+            "session_id": data.get("session_id") or session_id,
+            "playback_plan": new_plan,
+            "file_id": (info or {}).get("file_id"),
+            "playback_attempt_id": playback_attempt_id,
+            "plan_attempt_id": plan_attempt_id,
+            "attempted_plan_keys": [],
+            "attempt_count": 1,
+            "metered": bool((info or {}).get("metered", False)),
+            "quality_preference": quality_preference,
+            "client_features": body.get("client_features") or [],
+            "client_capabilities": body.get("client_capabilities") or {},
+            "client_playback_context": body.get("client_playback_context") or {},
+        }
+    # Find playback fields mentioned by Silo's validation error.
+    @staticmethod
+    def _invalid_fields(err):
+        errors = err.problem.get("errors") or []
+        text = " ".join(
+            "%s %s" % (
+                e.get("location", ""),
+                e.get("detail", ""),
+            )
+            for e in errors
+        ).lower()
+
+        return [
+            field
+            for field in _VOCAB
+            if field.lower() in text
+        ]
+
+    # Ask Silo for a playable stream URL using the supplied server-authoritative start position.
+    def start_playback(self, file_id, start_position=0.0, quality_preference="auto", direct_play_only=False):
+        body = self._start_body(
+            file_id,
+            start_position,
+            quality_preference=quality_preference,
+            direct_play_only=direct_play_only,
+        )
+
+        data = self._json(            "POST",
+            "/api/v2/playback/start",
+            body=body,
+        )
+
+        plan = data.get("playback_plan")
+
+        if not plan:
+            terminal = data.get("terminal") or data.get("outcome")
+            if (
+                direct_play_only
+                and isinstance(terminal, dict)
+                and terminal.get("reason") == "client_hls_unsupported"
+            ):
+                raise SiloError(
+                    "Only allow direct play is enabled, but Silo determined this "
+                    "item needs an HLS adaptation route. Turn off 'Only allow direct "
+                    "play' to permit remuxing/transcoding. If you expect this file "
+                    "to direct play, check its video profile/HDR format, selected "
+                    "audio track, subtitles, and Silo playback diagnostics.",
+                    problem=terminal,
+                )
+            raise SiloError(
+                "Server refused playback: %s" % json.dumps(terminal)[:300],
+                problem=terminal if isinstance(terminal, dict) else {},
+            )
+
+        if direct_play_only and str(plan.get("delivery") or "").strip().lower() != "original_http":
+            raise SiloError(
+                "Direct play only is enabled, but Silo selected %s delivery." %
+                (plan.get("delivery") or "an unsupported")
+            )
+
+        stream = plan.get("stream") or {}
+        url = self.abs_url(stream.get("url"))
+
+        if not url:
+            raise SiloError("Silo returned a playback plan without a stream URL.")
+
+        # Kodi's VideoPlayer uses its own HTTP client rather than the Python
+        # requests.Session above. Include both stream-specific headers from Silo
+        # and the account/profile headers needed to open the stream endpoint.
+        headers = dict(stream.get("headers") or {})
+        auth_headers = self._headers()
+
+        for key in ("Authorization", "X-Profile-Id", "X-Profile-Token"):
+            value = auth_headers.get(key)
+            if value and key not in headers:
+                headers[key] = value
+
+        # Kodi supports per-URL HTTP headers with |Header=value&Header2=value.
+        if headers:
+            url += "|" + "&".join(
+                "%s=%s" % (key, quote(str(value), safe=""))
+                for key, value in headers.items()
+            )
+
+        log(
+            "delivery=%s protocol=%s outcome=%s start_position=%.3f"
+            % (
+                plan.get("delivery"),
+                stream.get("protocol"),
+                data.get("outcome"),
+                float(start_position),
+            )
+        )
+
+        return {
+            "url": url,
+            "session_id": data.get("session_id") or plan.get("session_id"),
+            "playback_plan": plan,
+            "file_id": str(file_id),
+            "playback_attempt_id": body.get("playback_attempt_id"),
+            "client_features": body.get("client_features") or [],
+            # Preserve the requested quality so a seek_reanchor can reproduce
+            # the attempt's intent while the server keeps its current frozen route.
+            "quality_preference": body.get("quality_preference") or "auto",
+            # plan_attempt_id is client-owned; keep one stable ID for all
+            # replans in this playback session, matching Silo's other clients.
+            "plan_attempt_id": uuid.uuid4().hex,
+            "attempted_plan_keys": [],
+            "attempt_count": 1,
+            "metered": bool(body.get("metered", False)),
+            "client_capabilities": body.get("client_capabilities") or {},
+            "client_playback_context": body.get("client_playback_context") or {},
+        }
+
+    # Mint the v2 owner-bound control-socket credential used by the web player.
+    def playback_control_socket_ticket(self, session_id):
+        if not session_id:
+            raise SiloError("Playback session ID is required.")
+
+        data = self._json(
+            "POST",
+            "/api/v2/playback/sessions/%s/control/ws-ticket" % session_id,
+            body={
+                "installation_id": self._installation_id(),
+            },
+            timeout=10,
+            log_not_found=False,
+        ) or {}
+
+        ticket = str(data.get("ticket") or "")
+        protocol = str(data.get("protocol") or "")
+        if (
+            not ticket
+            or protocol != "silo.playback-control.v2"
+        ):
+            raise SiloError("Silo returned an invalid playback control credential.")
+
+        return data
+
+    # Send the current Kodi playback position to Silo.
+    def report_progress(self, session_id, sequence, position, paused):
+        self._send(
+            "POST",
+            "/api/v2/playback/%s/progress" % session_id,
+            body={
+                "installation_id": self._installation_id(),
+                "sequence": int(sequence),
+                "position": float(position),
+                "is_paused": bool(paused),
+            },
+        )
+
+    # Tell Silo that the playback session ended.
+    def stop_playback(self, session_id, sequence, position):
+        # Silo requires stop_id to be a canonical UUID, not uuid.uuid4().hex.
+        stop_id = str(uuid.uuid4())
+
+        self._send(
+            "DELETE",
+            "/api/v2/playback/%s" % session_id,
+            body={
+                "installation_id": self._installation_id(),
+                "stop_id": stop_id,
+                "sequence": int(sequence),
+                "position": float(position),
+                "is_paused": False,
+            },
+        )
