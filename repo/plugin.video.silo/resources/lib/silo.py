@@ -1823,6 +1823,22 @@ class SiloClient:
         items = data.get("items") or []
         return items if isinstance(items, list) else []
 
+    def item_box_set(self, content_id, library_id):
+        """Retrieve the box set associated with one movie, if it has one."""
+        content_id = str(content_id or "").strip()
+        library_id = str(library_id or "").strip()
+        if not content_id or not library_id:
+            raise SiloError("A content ID and library ID are required.")
+
+        data = self._json(
+            "GET",
+            "/api/v2/catalog/items/%s/box-set" % quote(content_id, safe=""),
+            params={"library_id": library_id, "image_size": "medium"},
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
     def box_set(self, collection_id, library_id):
         """Retrieve one TMDB Box Set and its accessible movies in release order."""
         collection_id = str(collection_id or "").strip()
@@ -2069,7 +2085,7 @@ class SiloClient:
     # Silo's current API documents a maximum catalog page size of 200, so use
     # that maximum to reduce the number of HTTP round trips for large libraries.
     def catalog_page(self, library_id, cursor=None, limit=200,
-                     name_prefix=None, sort=None, seek=None, group=None):
+                     name_prefix=None, sort=None, seek=None):
         """Return one Silo catalog page and its continuation cursor."""
         limit = max(1, min(int(limit or 200), 200))
 
@@ -2079,10 +2095,6 @@ class SiloClient:
             "skip_total": "true",
             "image_size": "medium",
         }
-        if group == "box_set":
-            params["source"] = "query"
-            params["group"] = "box_set"
-
         if name_prefix:
             params["name_prefix"] = str(name_prefix)
         if sort:
@@ -2108,7 +2120,7 @@ class SiloClient:
 
     # Return one server-side alphabet page and its total/has-more information.
     def catalog_prefix_page(self, library_id, name_prefix, offset=0,
-                            limit=200, include_total=False, group=None):
+                            limit=200, include_total=False):
         """Return one indexed title-prefix page using Silo's seek support."""
         prefix = str(name_prefix or "").strip()
         if not prefix:
@@ -2130,10 +2142,6 @@ class SiloClient:
             "sort": "title",
             "seek": offset,
         }
-        if group == "box_set":
-            params["source"] = "query"
-            params["group"] = "box_set"
-
         data = self._json(
             "GET",
             "/api/v2/catalog",
@@ -2156,7 +2164,7 @@ class SiloClient:
         )
 
 
-    def catalog(self, library_id, limit=200, group=None):
+    def catalog(self, library_id, limit=200):
         items = []
         cursor = None
 
@@ -2165,7 +2173,6 @@ class SiloClient:
                 library_id,
                 cursor=cursor,
                 limit=limit,
-                group=group,
             )
 
             items.extend(page_items)

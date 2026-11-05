@@ -397,7 +397,7 @@ def paginate_directory(items, page):
 
 
 def add_previous_page(library_id=None, series_id=None, season_number=None,
-                      action=None, page=1, letter=None, box_sets_enabled=None):
+                      action=None, page=1, letter=None):
     """Add a Previous Page folder when the current directory is past page 1."""
     try:
         page_number = int(page or 1)
@@ -420,9 +420,6 @@ def add_previous_page(library_id=None, series_id=None, season_number=None,
         params["season_number"] = season_number
     if letter:
         params["letter"] = letter
-    if box_sets_enabled is not None:
-        params["box_sets_enabled"] = int(bool(box_sets_enabled))
-
     item = xbmcgui.ListItem(label="Previous Page")
     _directory_art(item, "folder-page")
     xbmcplugin.addDirectoryItem(
@@ -2374,7 +2371,7 @@ def set_watch_state(list_item, progress, content_type=None):
 
 def get_content_id(item):
     """Return a Silo catalog item's content ID."""
-    return item.get("content_id") or item.get("id")
+    return item.get("content_id") or item.get("ContentID") or item.get("id")
 
 
 def get_box_set_id(item):
@@ -6998,7 +6995,6 @@ def list_libraries(client):
                 build_url(
                     action="library",
                     library_id=library_id,
-                    box_sets_enabled=int(library.get("box_sets_enabled") is True),
                 ),
                 item,
                 True,
@@ -7259,15 +7255,217 @@ def _render_catalog_items(client, data, section_title=None, merged_group_key=Non
 
 
 
-def list_library(client, library_id, cursor=None, box_sets_enabled=False):
+def library_box_sets_enabled():
+    """Whether to combine TMDB collections into virtual library cards."""
+    return ADDON.getSetting("library_box_sets") != "false"
+
+
+def build_library_box_set_items(client, items, library_id):
+    """Replace Box Set member movies with virtual cards for this page only.
+
+    Membership is resolved live, concurrently, and only for movie cards on
+    the page currently being opened. No result is persisted between pages.
+    """
+    if not library_box_sets_enabled() or not items:
+        return items
+
+    movie_ids = []
+    seen = set()
+    for item in items:
+        media_type = str(item.get("type") or item.get("media_type") or "").lower()
+        if media_type not in ("movie", "film"):
+            continue
+        content_id = str(get_content_id(item) or "").strip()
+        if content_id and content_id not in seen:
+            seen.add(content_id)
+            movie_ids.append(content_id)
+
+    if not movie_ids:
+        return items
+
+    # Each worker uses its own requests.Session. Collection membership calls
+    # run in parallel rather than serially holding up the Kodi directory.
+    # The directory page is capped at 200 items, so this opens one
+    # membership lookup per movie on this page at the same time. There is no
+    # bulk ItemBoxSet endpoint in the current Silo API.
+    worker_count = len(movie_ids)
+    chunks = [[content_id] for content_id in movie_ids]
+
+    def fetch_chunk(chunk):
+        worker_client = SiloClient()
+        worker_client.cfg.update(client.cfg)
+        worker_client._caps = client._caps
+        found = {}
+
+        for content_id in chunk:
+            try:
+                response = worker_client.item_box_set(content_id, library_id) or {}
+            except SiloError as exc:
+                log(
+                    "Unable to resolve Box Set membership for %s: %s"
+                    % (content_id, exc),
+                    xbmc.LOGDEBUG,
+                )
+                continue
+
+            # ItemBoxSet returns BoxSetDetailView as a flat object.
+            box_set = response.get("box_set")
+            if not isinstance(box_set, dict):
+                box_set = response
+            if not isinstance(box_set, dict):
+                continue
+
+            collection_id = (
+                box_set.get("id")
+                or box_set.get("collection_id")
+                or box_set.get("CollectionID")
+            )
+            if not collection_id:
+                continue
+
+            members = box_set.get("items") or box_set.get("Items") or []
+            if not isinstance(members, list):
+                members = []
+
+            member_ids = set()
+            for member in members:
+                member_id = (
+                    get_content_id(member)
+                    if isinstance(member, dict)
+                    else None
+                )
+                if member_id:
+                    member_ids.add(str(member_id))
+            member_ids.add(content_id)
+
+            # Anchor a collection to its alphabetically first movie. This
+            # makes the Box Set appear once across A-Z pages while later pages
+            # can still suppress the collection's remaining member movies.
+            anchor = None
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                member_id = get_content_id(member)
+                if not member_id:
+                    continue
+                key = (
+                    _library_group_title(member).casefold(),
+                    str(member_id),
+                )
+                if anchor is None or key < anchor[0]:
+                    anchor = (key, str(member_id))
+            anchor_id = anchor[1] if anchor else content_id
+
+            normalized_box_set = {
+                "id": collection_id,
+                "library_id": (
+                    box_set.get("library_id")
+                    or box_set.get("LibraryID")
+                    or library_id
+                ),
+                "title": box_set.get("title") or box_set.get("Title") or "Box Set",
+                "overview": box_set.get("overview") or box_set.get("Overview") or "",
+                "poster_url": box_set.get("poster_url") or box_set.get("PosterURL") or "",
+                "poster_thumbhash": (
+                    box_set.get("poster_thumbhash")
+                    or box_set.get("PosterThumbhash")
+                    or ""
+                ),
+                "backdrop_url": (
+                    box_set.get("backdrop_url")
+                    or box_set.get("BackdropURL")
+                    or ""
+                ),
+                "backdrop_thumbhash": (
+                    box_set.get("backdrop_thumbhash")
+                    or box_set.get("BackdropThumbhash")
+                    or ""
+                ),
+                "movie_count": (
+                    box_set.get("movie_count")
+                    or box_set.get("member_count")
+                    or box_set.get("MemberCount")
+                    or len(member_ids)
+                ),
+                "played_count": (
+                    box_set.get("played_count")
+                    or box_set.get("PlayedCount")
+                    or 0
+                ),
+                "first_year": box_set.get("first_year") or box_set.get("FirstYear") or 0,
+                "last_year": box_set.get("last_year") or box_set.get("LastYear") or 0,
+            }
+            card = box_set_search_catalog_item(normalized_box_set)
+            if not card:
+                continue
+
+            key = get_box_set_id(card)
+            if key:
+                found[key] = {
+                    "card": card,
+                    "member_ids": member_ids,
+                    "anchor_id": anchor_id,
+                }
+
+        return found
+
+    collections = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(fetch_chunk, chunk)
+            for chunk in chunks
+            if chunk
+        ]
+        for future in as_completed(futures):
+            try:
+                collections.update(future.result())
+            except Exception as exc:
+                log(
+                    "Box Set membership worker failed: %s" % exc,
+                    xbmc.LOGWARNING,
+                )
+
+    if not collections:
+        return items
+
+    page_ids = {
+        str(get_content_id(item))
+        for item in items
+        if get_content_id(item)
+    }
+    member_ids = set()
+    cards_by_anchor = {}
+    for collection in collections.values():
+        member_ids.update(collection["member_ids"])
+        anchor_id = collection["anchor_id"]
+        if anchor_id in page_ids:
+            cards_by_anchor[anchor_id] = collection["card"]
+
+    # Replace each collection's first alphabetical member in-place. The
+    # remaining members are removed from this page, including those whose
+    # Box Set card correctly appeared on an earlier A-Z page.
+    output = []
+    for item in items:
+        media_type = str(item.get("type") or item.get("media_type") or "").lower()
+        content_id = str(get_content_id(item) or "")
+        if media_type in ("movie", "film") and content_id in member_ids:
+            card = cards_by_anchor.get(content_id)
+            if card:
+                output.append(card)
+            continue
+        output.append(item)
+
+    return output
+
+
+def list_library(client, library_id, cursor=None):
     """Display the compact A-Z index for one Silo library."""
     if not library_id:
         raise SiloError("No library ID was supplied.")
 
-    group = "box_set" if box_sets_enabled else None
-    # Count the same grouped list the user will browse below.
-    items = client.catalog(library_id, limit=200, group=group)
-
+    # Keep the library index a single normal catalogue read. Box Set
+    # membership is resolved only for the selected letter page.
+    items = client.catalog(library_id, limit=200)
     counts = library_letter_counts(items)
 
     xbmcplugin.setPluginCategory(HANDLE, "Library")
@@ -7292,7 +7490,6 @@ def list_library(client, library_id, cursor=None, box_sets_enabled=False):
                 letter=group,
                 page=1,
                 expected_count=count,
-                box_sets_enabled=int(box_sets_enabled),
             ),
             item,
             True,
@@ -7300,8 +7497,7 @@ def list_library(client, library_id, cursor=None, box_sets_enabled=False):
 
     xbmcplugin.endOfDirectory(HANDLE)
 
-def list_library_letter(client, library_id, letter, page=None, expected_count=None,
-                        box_sets_enabled=False):
+def list_library_letter(client, library_id, letter, page=None, expected_count=None):
     """Display one alphabet group using Silo's indexed prefix query when safe."""
     if not library_id:
         raise SiloError("No library ID was supplied.")
@@ -7315,17 +7511,13 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
     except (TypeError, ValueError):
         page_number = 1
 
-    group = "box_set" if box_sets_enabled else None
     grouped_items = None
     server_prefix_validated = False
     server_has_more = False
 
-    # For ordinary catalog cards, Silo's indexed prefix follows the same
-    # title key the Kodi alphabet folders display. Box Set cards are different:
-    # the server indexes their representative movie, while Kodi groups the
-    # visible Box Set title. Use the local grouped-list path for Box Sets so
-    # pages remain consistent with the displayed letter and its item count.
-    if not group and len(letter) == 1 and letter.isalpha():
+    # Always use Silo's indexed title-prefix query when available. Box Set
+    # lookups are restricted to the returned page below.
+    if len(letter) == 1 and letter.isalpha():
         try:
             expected = int(expected_count)
         except (TypeError, ValueError):
@@ -7339,7 +7531,6 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
                     offset=(page_number - 1) * get_directory_page_size(),
                     limit=get_directory_page_size(),
                     include_total=(page_number == 1),
-                    group=group,
                 )
             )
 
@@ -7368,7 +7559,6 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
         all_items = client.catalog(
             library_id,
             limit=200,
-            group=group,
         )
         grouped_items = [
             item
@@ -7386,6 +7576,9 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
             page_number,
         )
 
+    if library_box_sets_enabled():
+        page_items = build_library_box_set_items(client, page_items, library_id)
+
     xbmcplugin.setPluginCategory(HANDLE, letter)
     xbmcplugin.setContent(HANDLE, "movies")
 
@@ -7394,7 +7587,6 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
         action="library_letter",
         page=page_number,
         letter=letter,
-        box_sets_enabled=box_sets_enabled,
     )
 
     detail_map = fetch_detail_metadata(
@@ -7499,7 +7691,6 @@ def list_library_letter(client, library_id, letter, page=None, expected_count=No
                 letter=letter,
                 page=page_number + 1,
                 expected_count=expected_count,
-                box_sets_enabled=int(box_sets_enabled),
             ),
             next_item,
             True,
@@ -10332,8 +10523,6 @@ def router(client):
             client,
             params.get("library_id"),
             params.get("cursor"),
-            box_sets_enabled=str(params.get("box_sets_enabled") or "").lower()
-            in ("1", "true", "yes", "on"),
         )
         return
 
@@ -10352,8 +10541,6 @@ def router(client):
             params.get("letter"),
             params.get("page"),
             params.get("expected_count"),
-            box_sets_enabled=str(params.get("box_sets_enabled") or "").lower()
-            in ("1", "true", "yes", "on"),
         )
         return
 
