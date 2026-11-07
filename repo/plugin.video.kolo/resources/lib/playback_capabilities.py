@@ -5,7 +5,9 @@ CLIENT_DV8_BASE_LAYER_FALLBACK = "client_dv8_base_layer_fallback_v1"
 CLIENT_MANAGED_DYNAMIC_RANGE = "client_managed_dynamic_range_v1"
 
 
-def kodi_original_http_validated_claims(\n    video_codecs, output_hdr_details, client_manages_dynamic_range=False\n):
+def kodi_original_http_validated_claims(
+    video_codecs, output_hdr_details, client_manages_dynamic_range=False
+):
     """Return only original-HTTP claims supported by Kodi's reported facts.
 
     Kodi's System.SupportedHDRTypes label reports display formats, not native
