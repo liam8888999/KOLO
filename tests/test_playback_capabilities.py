@@ -17,8 +17,28 @@ sys.path.insert(0, str(PLUGIN_LIB))
 from playback_capabilities import (  # noqa: E402
     CLIENT_DV8_BASE_LAYER_FALLBACK,
     CLIENT_MANAGED_DYNAMIC_RANGE,
+    is_kodi_managed_dv8_source,
     kodi_original_http_validated_claims,
 )
+
+
+def safe_dv8_version():
+    return {
+        "codec_video": "hevc",
+        "video_tracks": [{
+            "codec": "hevc",
+            "profile": "Main 10",
+            "bit_depth": 10,
+            "dv_profile": 8,
+            "dv_bl_compat_id": 1,
+            "dv_config_present": True,
+            "dv_bl_compat_id_present": True,
+            "dv_bl_present": True,
+            "dv_el_present": False,
+            "dv_enhancement_layer": "none",
+            "hdr10_plus": True,
+        }],
+    }
 
 
 class KodiOriginalHTTPClaimsTests(unittest.TestCase):
@@ -37,14 +57,7 @@ class KodiOriginalHTTPClaimsTests(unittest.TestCase):
         )
         self.assertEqual([CLIENT_DV8_BASE_LAYER_FALLBACK], claims)
 
-    def test_hdr10_plus_is_also_reported_as_hdr10_by_kodi_parser(self):
-        claims = kodi_original_http_validated_claims(
-            ["hevc"],
-            {"hdr10": True, "hdr10_plus": True},
-        )
-        self.assertEqual([CLIENT_DV8_BASE_LAYER_FALLBACK], claims)
-
-    def test_dolby_vision_without_hdr10_or_hlg_does_not_enable_fallback(self):
+    def test_dolby_vision_without_hdr10_or_hlg_does_not_enable_output_claim(self):
         claims = kodi_original_http_validated_claims(
             ["hevc"],
             {"hdr10": False, "hdr10_plus": False, "hlg": False,
@@ -52,15 +65,15 @@ class KodiOriginalHTTPClaimsTests(unittest.TestCase):
         )
         self.assertEqual([], claims)
 
-    def test_unknown_output_capabilities_do_not_enable_fallback(self):
+    def test_unknown_output_capabilities_do_not_enable_base_layer_claim(self):
         self.assertEqual([], kodi_original_http_validated_claims(["hevc"], None))
         self.assertEqual([], kodi_original_http_validated_claims(["hevc"], {}))
 
-    def test_missing_hevc_support_does_not_enable_fallback(self):
+    def test_missing_hevc_support_does_not_enable_claims(self):
         self.assertEqual(
             [],
             kodi_original_http_validated_claims(
-                ["h264", "av1"], {"hdr10": True}
+                ["h264", "av1"], {"hdr10": True}, safe_dv8_version()
             ),
         )
 
@@ -72,34 +85,57 @@ class KodiOriginalHTTPClaimsTests(unittest.TestCase):
             ),
         )
 
-    def test_managed_dynamic_range_is_opt_in_and_requires_hevc(self):
-        self.assertEqual(
-            [],
-            kodi_original_http_validated_claims(
-                ["hevc"], None, client_manages_dynamic_range=False
-            ),
-        )
+    def test_proven_single_layer_dv8_main10_is_managed_automatically(self):
+        version = safe_dv8_version()
+        self.assertTrue(is_kodi_managed_dv8_source(version, ["hevc"]))
         self.assertEqual(
             [CLIENT_MANAGED_DYNAMIC_RANGE],
-            kodi_original_http_validated_claims(
-                ["hevc"], None, client_manages_dynamic_range=True
-            ),
-        )
-        self.assertEqual(
-            [],
-            kodi_original_http_validated_claims(
-                ["h264"], None, client_manages_dynamic_range=True
-            ),
+            kodi_original_http_validated_claims(["hevc"], None, version),
         )
 
-    def test_managed_dynamic_range_can_coexist_with_profile8_fallback(self):
+    def test_dv8_managed_claim_can_coexist_with_hdr_output_claim(self):
         self.assertEqual(
             [CLIENT_DV8_BASE_LAYER_FALLBACK, CLIENT_MANAGED_DYNAMIC_RANGE],
             kodi_original_http_validated_claims(
-                ["hevc"], {"hdr10": True},
-                client_manages_dynamic_range=True,
+                ["hevc"], {"hdr10": True}, safe_dv8_version()
             ),
         )
+
+    def test_dv5_never_receives_managed_dynamic_range_claim(self):
+        version = safe_dv8_version()
+        version["video_tracks"][0]["dv_profile"] = 5
+        self.assertFalse(is_kodi_managed_dv8_source(version, ["hevc"]))
+        self.assertEqual(
+            [],
+            kodi_original_http_validated_claims(["hevc"], None, version),
+        )
+
+    def test_dv8_requires_proven_base_layer_and_no_enhancement_layer(self):
+        for key, value in (
+            ("dv_config_present", False),
+            ("dv_bl_compat_id_present", False),
+            ("dv_bl_present", False),
+            ("dv_el_present", True),
+            ("dv_enhancement_layer", "unknown"),
+        ):
+            version = safe_dv8_version()
+            version["video_tracks"][0][key] = value
+            self.assertFalse(
+                is_kodi_managed_dv8_source(version, ["hevc"]),
+                "unsafe source unexpectedly accepted for %s" % key,
+            )
+
+    def test_dv8_requires_supported_base_layer_compatibility_id(self):
+        for compat_id in (0, 3, 5, 6, 7):
+            version = safe_dv8_version()
+            version["video_tracks"][0]["dv_bl_compat_id"] = compat_id
+            self.assertFalse(is_kodi_managed_dv8_source(version, ["hevc"]))
+
+    def test_dv8_requires_hevc_main10_ten_bit(self):
+        for key, value in (("profile", "Main"), ("bit_depth", 8), ("codec", "h264")):
+            version = safe_dv8_version()
+            version["video_tracks"][0][key] = value
+            self.assertFalse(is_kodi_managed_dv8_source(version, ["hevc"]))
 
 
 if __name__ == "__main__":

@@ -45,8 +45,7 @@ https://liam8888999.github.io/KOLO/
 * Log Silo's playback decision reason, source/output dynamic range, selected transformations and degradation codes to make unexpected transcoding diagnosable.
 * Use the latest server-side resume position with Kodi's native Resume / Start from beginning prompt.
 * Report playback capabilities to Silo Server, including supported video/audio and display HDR details where Kodi exposes them, to help the server plan playback.
-* Allow compatible Dolby Vision Profile 8 files to play through their HDR10/HLG-compatible base layer when KOLO declares HEVC support and Kodi reports the matching output range; native DV profiles are never guessed.
-* Offer an advanced, opt-in Kodi-managed dynamic-range claim for devices verified to handle HDR/Dolby Vision presentation themselves; disabled by default because Kodi decoder and renderer support varies by device.
+* Automatically try Kodi's native player on proven, single-layer Dolby Vision Profile 8 Main 10 files, across supported platforms; if Kodi reports a decoder/startup playback error, replan through Silo's available remux/transcode routes. Other Dolby Vision profiles remain on Silo's normal capability-planned path.
 * Negotiate server-supported HLS subtitle renditions so compatible embedded text tracks can be offered by Kodi's native player.
 * Skip available intro, recap and credits segments. You can choose prompts or enable automatic skipping separately for intros, recaps and credits in the add-on settings.
 * Support server-side playback termination, which stops the active Kodi stream when Silo Server revokes or terminates its session.

@@ -60,10 +60,7 @@ import xbmcaddon
 import xbmcgui
 import xbmcvfs
 
-from .playback_capabilities import (
-    CLIENT_MANAGED_DYNAMIC_RANGE,
-    kodi_original_http_validated_claims,
-)
+from .playback_capabilities import kodi_original_http_validated_claims
 
 
 # Read addon metadata and determine where Kodi should store persistent configuration.
@@ -2516,7 +2513,10 @@ class SiloClient:
 
 
     # Build a protocol-v3 playback/start request.
-    def _start_body(self, file_id, start_position=0.0, quality_preference="auto", direct_play_only=False):
+    def _start_body(
+        self, file_id, start_position=0.0, quality_preference="auto",
+        direct_play_only=False, kodi_source_version=None
+    ):
         caps = self.playback_caps()
         pv = self._protocol_version()
         output_hdr_details = _kodi_output_hdr_details()
@@ -2610,29 +2610,23 @@ class SiloClient:
             dict(delivery_template),
         )
         original_delivery.update(delivery_template)
-        # Kodi's display HDR label does not expose Dolby Vision profile/level
-        # support, so never invent native DV profile claims. It does provide
-        # enough evidence for Silo's narrower Profile 8 base-layer path:
-        # KOLO declares HEVC decode support above and only enables this claim
-        # when the active output explicitly reports HDR10 or HLG.
-        kodi_manages_dynamic_range = ADDON.getSettingBool(
-            "allow_kodi_dynamic_range_management"
-        )
+        # Only a file-specific, proven single-layer DV Profile 8 Main 10
+        # source can opt into Kodi-managed dynamic-range handling. The user
+        # does not have to guess whether their current platform can decode it:
+        # Kodi's own player will attempt the original stream and report failure.
         original_delivery["validated_claims"] = kodi_original_http_validated_claims(
-            video,
-            output_hdr_details,
-            client_manages_dynamic_range=kodi_manages_dynamic_range,
+            video, output_hdr_details, kodi_source_version
         )
         log(
             "Original playback capabilities: HEVC=%s HDR10/HLG=%s "
-            "DV8 base-layer fallback=%s Kodi-managed dynamic range=%s"
+            "DV8 base-layer fallback=%s Kodi-managed DV8=%s"
             % (
                 "hevc" in video,
                 bool(output_hdr_details and (
                     output_hdr_details.get("hdr10") or output_hdr_details.get("hlg")
                 )),
                 "client_dv8_base_layer_fallback_v1" in original_delivery["validated_claims"],
-                kodi_manages_dynamic_range,
+                "client_managed_dynamic_range_v1" in original_delivery["validated_claims"],
             ),
             xbmc.LOGDEBUG,
         )
@@ -3022,12 +3016,16 @@ class SiloClient:
         ]
 
     # Ask Silo for a playable stream URL using the supplied server-authoritative start position.
-    def start_playback(self, file_id, start_position=0.0, quality_preference="auto", direct_play_only=False):
+    def start_playback(
+        self, file_id, start_position=0.0, quality_preference="auto",
+        direct_play_only=False, kodi_source_version=None
+    ):
         body = self._start_body(
             file_id,
             start_position,
             quality_preference=quality_preference,
             direct_play_only=direct_play_only,
+            kodi_source_version=kodi_source_version,
         )
 
         data = self._json(            "POST",
