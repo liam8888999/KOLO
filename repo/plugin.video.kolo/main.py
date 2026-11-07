@@ -1839,12 +1839,17 @@ def _select_preferred_subtitle_index(
         return (best_for_language(tracks, preferred) or {}).get("index")
 
     if mode == "auto":
-        if preferred == "":
+        if preferred_language == "":
             return None
-        if not preferred or (
-            _normalise_track_language(audio_language)
-            and _normalise_track_language(audio_language).split("-", 1)[0]
-            == _normalise_track_language(preferred).split("-", 1)[0]
+        normalized_preferred = _normalise_track_language(preferred)
+        normalized_audio = _normalise_track_language(audio_language)
+        if (
+            not normalized_preferred
+            or (
+                normalized_audio
+                and normalized_audio.split("-", 1)[0]
+                == normalized_preferred.split("-", 1)[0]
+            )
         ):
             return (forced_for_audio() or {}).get("index")
         return (best_for_language(tracks, preferred) or {}).get("index")
@@ -3548,6 +3553,8 @@ PROFILE_SETTING_LABELS = {
     "playback.intro_skip_mode": "Skip intros",
     "playback.auto_skip_recap": "Auto-skip recaps",
     "playback.auto_skip_credits": "Auto-skip credits",
+    "playback.auto_play_next": "Auto-play next episode",
+    "playback.next_up_prompt_seconds": "Next episode prompt (seconds)",
 }
 
 PROFILE_ENUMS = {
@@ -3775,6 +3782,7 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
         "playback.show_forced_subtitles",
         "playback.auto_skip_recap",
         "playback.auto_skip_credits",
+        "playback.auto_play_next",
     ):
         current_bool = bool(current) if current is not None else False
         selected = xbmcgui.Dialog().select(
@@ -3802,10 +3810,14 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
             return
         new_value = str(entered).strip()
 
-    elif key == "playback.max_bitrate_kbps":
+    elif key in ("playback.max_bitrate_kbps", "playback.next_up_prompt_seconds"):
         current_text = "" if current is None else str(current)
         entered = xbmcgui.Dialog().input(
-            "Maximum bitrate in kbps (blank for no cap)",
+            (
+                "Maximum bitrate in kbps (blank for no cap)"
+                if key == "playback.max_bitrate_kbps"
+                else "Seconds before the episode ends (0-120)"
+            ),
             defaultt=current_text,
             type=xbmcgui.INPUT_NUMERIC,
         )
@@ -3818,11 +3830,19 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
             except ValueError:
                 notify("Enter a bitrate in kbps")
                 return
-            if not 100 <= new_value <= 200000:
-                notify("Bitrate must be between 100 and 200000 kbps")
+            if key == "playback.max_bitrate_kbps":
+                if not 100 <= new_value <= 200000:
+                    notify("Bitrate must be between 100 and 200000 kbps")
+                    return
+            elif not 0 <= new_value <= 120:
+                notify("Prompt must be between 0 and 120 seconds")
                 return
         else:
-            new_value = None
+            if key == "playback.max_bitrate_kbps":
+                new_value = None
+            else:
+                notify("Enter 0 to disable the next episode prompt")
+                return
 
     else:
         notify("This preference does not have a Kodi editor yet")
@@ -3885,6 +3905,8 @@ def list_scoped_playback_preferences(client, scope, library_id=None, series_id=N
             "playback.intro_skip_mode",
             "playback.auto_skip_recap",
             "playback.auto_skip_credits",
+            "playback.auto_play_next",
+            "playback.next_up_prompt_seconds",
         )
     else:
         keys = (
@@ -3898,7 +3920,11 @@ def list_scoped_playback_preferences(client, scope, library_id=None, series_id=N
             client,
             key,
             "Overrides the profile-wide setting for this %s." % (
-                "library" if scope == "profile_library" else "series"
+                {
+                    "profile_device": "Kodi device",
+                    "profile_library": "library",
+                    "profile_series": "series",
+                }[scope]
             ),
             scope=scope,
             **context
