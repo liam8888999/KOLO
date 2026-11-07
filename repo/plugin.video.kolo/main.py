@@ -3201,14 +3201,23 @@ def list_search_results(client, query, page=1):
     offset = (page_number - 1) * search_page_size
 
     # Search respects the active profile's Silo media-scope preference.
-    # KOLO currently renders video catalog items; use video for its default
-    # and all only when the profile explicitly requests a wider search.
+    # Use the expanded video scope when this server advertises it, so episode
+    # matches are included alongside movies and series without making older
+    # Silo builds reject the query.
     media_scope = _profile_setting(client, "search.media_scope", "video")
     if media_scope == "audiobook":
         notify("The active Silo profile is set to Audiobooks, but KOLO currently supports video playback only.")
         media_scope = "video"
     elif media_scope not in ("video", "all"):
         media_scope = "video"
+    if media_scope == "video":
+        try:
+            capabilities = client.catalog_search_capabilities()
+        except SiloError as exc:
+            log("Unable to read catalog search capabilities: %s" % exc, xbmc.LOGDEBUG)
+            capabilities = {}
+        if capabilities.get("video_with_episodes_scope") is True:
+            media_scope = "video_with_episodes"
 
     # Media and people searches are independent. Each client owns a
     # separate requests.Session so concurrent requests do not share session state.
