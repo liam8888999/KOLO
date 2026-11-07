@@ -6978,6 +6978,9 @@ def list_root(client, page=None):
         True,
     )
 
+    # Profile-pinned destinations stay close to the top-level library entry.
+    add_profile_navigation_shortcuts(client)
+
     # Keep personal lists and collections immediately below Libraries.
     add_your_stuff_folder()
 
@@ -7064,6 +7067,15 @@ def list_root(client, page=None):
         build_url(action="logout"),
         logout_item,
         False,
+    )
+
+    preferences_item = xbmcgui.ListItem(label="Silo Preferences")
+    preferences_item.setArt({"icon": "DefaultAddonService.png"})
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_url(action="profile_preferences"),
+        preferences_item,
+        True,
     )
 
     # Keep Settings at the bottom of the root list when logged in as well.
@@ -7729,8 +7741,11 @@ def list_home_section(client, section_id):
     _render_catalog_items(client, normalized)
 
 def list_libraries(client):
-    """Display the accessible Silo libraries inside the Libraries folder."""
-    libraries = client.libraries()
+    """Display only profile-visible libraries in the saved profile order."""
+    libraries, _disabled_ids, _order_ids = _profile_library_view(
+        client,
+        include_hidden=False,
+    )
 
     xbmcplugin.setPluginCategory(HANDLE, "Libraries")
     xbmcplugin.setContent(HANDLE, "files")
@@ -8235,10 +8250,33 @@ def build_library_box_set_items(client, items, library_id):
 
 
 def list_library(client, library_id, cursor=None):
-    """Display the compact A-Z index for one Silo library."""
+    """Display library sections, collections and the compact A-Z index."""
     if not library_id:
         raise SiloError("No library ID was supplied.")
 
+    xbmcplugin.setPluginCategory(HANDLE, "Library")
+    xbmcplugin.setContent(HANDLE, "files")
+
+    sections_item = xbmcgui.ListItem(label="Library Sections")
+    sections_item.setArt({"icon": "DefaultFolder.png"})
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_url(action="library_sections", library_id=library_id),
+        sections_item,
+        True,
+    )
+
+    collections_item = xbmcgui.ListItem(label="Collections")
+    _directory_art(collections_item, "folder-collections")
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_url(action="library_collections", library_id=library_id),
+        collections_item,
+        True,
+    )
+
+    # Keep the library's A-Z title index intact; these extra folders are
+    # simply additional ways to browse the same library.
     # Keep the library index a single normal catalogue read. Box Set
     # membership is resolved only for the selected letter page.
     items = client.catalog(library_id, limit=200)
@@ -11113,6 +11151,46 @@ def router(client):
         list_root(client, params.get("page"))
         return
 
+    if action == "profile_preferences":
+        list_profile_preferences(client)
+        return
+
+    if action == "preferences_libraries":
+        list_library_preferences(client)
+        return
+
+    if action == "preferences_playback":
+        list_playback_preferences(client)
+        return
+
+    if action == "preferences_home":
+        list_home_preferences(client)
+        return
+
+    if action == "preferences_metadata":
+        list_metadata_preferences(client)
+        return
+
+    if action == "edit_profile_setting":
+        _edit_profile_setting(client, params.get("key"))
+        return
+
+    if action == "edit_metadata_language_overrides":
+        _edit_metadata_language_overrides(client)
+        return
+
+    if action == "edit_library_visibility":
+        _edit_library_visibility(client)
+        return
+
+    if action == "edit_library_order":
+        _edit_library_order(client)
+        return
+
+    if action == "edit_navigation_shortcuts":
+        _edit_navigation_shortcuts(client)
+        return
+
     if action == "root":
         list_root(
             client,
@@ -11298,6 +11376,33 @@ def router(client):
         list_library(
             client,
             params.get("library_id"),
+            params.get("cursor"),
+        )
+        return
+
+    if action == "library_sections":
+        list_library_sections(client, params.get("library_id"))
+        return
+
+    if action == "library_section":
+        list_library_section(
+            client,
+            params.get("library_id"),
+            params.get("section_id"),
+            params.get("title"),
+        )
+        return
+
+    if action == "library_collections":
+        list_library_collections(client, params.get("library_id"))
+        return
+
+    if action == "library_collection":
+        list_library_collection(
+            client,
+            params.get("library_id"),
+            params.get("collection_id"),
+            params.get("title"),
             params.get("cursor"),
         )
         return
