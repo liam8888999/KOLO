@@ -3931,8 +3931,6 @@ def list_series_playback_preferences(client, series_id):
 
 
 def list_home_preferences(client):
-    global _ACTIVE_PREFS_CLIENT
-    _ACTIVE_PREFS_CLIENT = client
     xbmcplugin.setPluginCategory(HANDLE, "Home & Search")
     xbmcplugin.setContent(HANDLE, "files")
     for key in (
@@ -3945,9 +3943,8 @@ def list_home_preferences(client):
             description = "Controls whether Next Up is grouped with Continue Watching or kept separate."
         elif key == "ui.next_up_new_releases_first":
             description = "Uses Silo's release detection when ordering Continue Watching and Next Up."
-        _profile_edit_item(key, description)
+        _profile_edit_item(client, key, description)
     xbmcplugin.endOfDirectory(HANDLE)
-    _ACTIVE_PREFS_CLIENT = None
 
 
 def list_metadata_preferences(client):
