@@ -2884,13 +2884,22 @@ def add_catalog_context_menu(list_item, catalog_item):
         if series_id:
             parent_params["series_id"] = series_id
 
-        if media_type in ("episode", "season"):
+            if media_type in ("episode", "season"):
             parent_label = "Open parent show"
         else:
             parent_label = "Open parent library"
         menu_items.append((
             parent_label,
             "RunPlugin(%s)" % build_url(**parent_params),
+        ))
+
+    if media_type == "series":
+        menu_items.append((
+            "Playback preferences for this series",
+            "RunPlugin(%s)" % build_url(
+                action="series_playback_preferences",
+                series_id=content_id,
+            ),
         ))
 
     try:
@@ -3460,6 +3469,19 @@ def _profile_edit_item(client, key, description=None, scope="profile", library_i
     item = xbmcgui.ListItem(label="%s: %s" % (title, value_label))
     item.setArt({"icon": "DefaultAddonService.png"})
     item.setInfo("video", {"title": title, "plot": description or ""})
+    try:
+        item.addContextMenuItems([(
+            "Reset to Silo default",
+            "RunPlugin(%s)" % build_url(
+                action="reset_profile_setting",
+                key=key,
+                scope=scope,
+                library_id=library_id,
+                series_id=series_id,
+            ),
+        )])
+    except Exception:
+        pass
     xbmcplugin.addDirectoryItem(
         HANDLE,
         build_url(
@@ -3537,13 +3559,12 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
     ):
         current_text = "" if current is None else str(current)
         entered = xbmcgui.Dialog().input(
-            "%s (BCP 47 language tag; blank clears)" % PROFILE_SETTING_LABELS[key],
+            "%s (BCP 47 language tag)" % PROFILE_SETTING_LABELS[key],
             defaultt=current_text,
         )
-        if entered is None:
+        if not entered:
             return
-        entered = str(entered).strip()
-        new_value = entered or None
+        new_value = str(entered).strip()
 
     elif key == "playback.max_bitrate_kbps":
         current_text = "" if current is None else str(current)
@@ -3711,14 +3732,11 @@ def _edit_metadata_language_overrides(client):
     current = _profile_setting(client, "catalog.metadata_language_overrides", {})
     if not isinstance(current, dict):
         current = {}
-    labels = [
-        "%s → %s" % (source, target)
-        for source, target in sorted(current.items())
-    ]
-    choices = ["Add / change an exception", "Remove an exception"] if labels else [
-        "Add an exception"
-    ]
-    choices.extend(labels)
+    languages = sorted(current)
+    choices = ["Add / change an exception"]
+    if languages:
+        choices.append("Remove an exception")
+        choices.extend("%s → %s" % (source, current[source]) for source in languages)
     selected = xbmcgui.Dialog().select("Metadata language exceptions", choices)
     if selected < 0:
         return
@@ -3738,34 +3756,24 @@ def _edit_metadata_language_overrides(client):
         )
         if not target:
             return
-        target = str(target).strip()
-        updated[source] = target
+        updated[source] = str(target).strip()
+    elif selected == 1:
+        remove_index = xbmcgui.Dialog().select(
+            "Remove which exception?",
+            ["%s → %s" % (source, current[source]) for source in languages],
+        )
+        if remove_index < 0:
+            return
+        updated.pop(languages[remove_index], None)
     else:
-        if choices[1] == "Remove an exception":
-            remove_index = selected - 2
-            key = sorted(current)[remove_index]
-            updated.pop(key, None)
-        else:
-            source = xbmcgui.Dialog().input(
-                "Original language code to change or remove",
-                defaultt="",
-            )
-            if not source:
-                return
-            source = str(source).strip().lower()
-            if source not in updated:
-                notify("No exception exists for %s" % source)
-                return
-            target = xbmcgui.Dialog().input(
-                "New language tag (blank removes)",
-                defaultt=str(updated[source]),
-            )
-            if target is None:
-                return
-            if str(target).strip():
-                updated[source] = str(target).strip()
-            else:
-                updated.pop(source, None)
+        source = languages[selected - 2]
+        target = xbmcgui.Dialog().input(
+            "New language tag (blank cancels; use Remove to delete)",
+            defaultt=str(updated[source]),
+        )
+        if not target:
+            return
+        updated[source] = str(target).strip()
     try:
         client.update_setting_value(
             "catalog.metadata_language_overrides",
@@ -11317,6 +11325,19 @@ def router(client):
             library_id=params.get("library_id"),
             series_id=params.get("series_id"),
         )
+        return
+
+    if action == "reset_profile_setting":
+        key = str(params.get("key") or "")
+        scope = str(params.get("scope") or "profile")
+        client.delete_setting_value(
+            key,
+            scope=scope,
+            library_id=params.get("library_id"),
+            series_id=params.get("series_id"),
+        )
+        notify("Preference reset to Silo default")
+        xbmc.executebuiltin("Container.Refresh")
         return
 
     if action == "choose_library_playback_preferences":
