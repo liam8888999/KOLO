@@ -4087,7 +4087,7 @@ def _edit_library_visibility(client):
 
 
 def _edit_library_order(client):
-    libraries, _disabled, order_ids = _profile_library_view(client, include_hidden=True)
+    libraries, _disabled, _order = _profile_library_view(client, include_hidden=True)
     if len(libraries) < 2:
         notify("At least two libraries are required to change their order")
         return
@@ -4104,10 +4104,8 @@ def _edit_library_order(client):
             labels,
         )
         if selected < 0:
-            if not ordered:
-                return
-            ordered.extend(remaining)
-            break
+            # A cancelled reorder must never partially overwrite the existing order.
+            return
         ordered.append(remaining.pop(selected))
     ids = [
         _safe_int(library.get("id"), 0)
@@ -4121,7 +4119,6 @@ def _edit_library_order(client):
     except SiloError as exc:
         notify("Could not save library order: %s" % str(exc)[:150])
 
-
 def _shortcut_display(item):
     if not isinstance(item, dict):
         return "Unknown shortcut"
@@ -4132,7 +4129,8 @@ def _edit_navigation_shortcuts(client):
     choices = [
         "Pin a library",
         "Pin a library section",
-        "Pin a collection",
+        "Pin a library collection",
+        "Pin a personal collection",
         "Remove a shortcut",
     ]
     selected = xbmcgui.Dialog().select("Navigation Shortcuts", choices)
@@ -4140,7 +4138,7 @@ def _edit_navigation_shortcuts(client):
         return
     shortcuts = client.navigation_shortcuts(force=True)
 
-    if selected == 3:
+    if selected == 4:
         if not shortcuts:
             notify("There are no pinned shortcuts")
             return
@@ -4158,80 +4156,124 @@ def _edit_navigation_shortcuts(client):
             notify("Could not remove shortcut: %s" % str(exc)[:150])
         return
 
-    libraries, _disabled, _order = _profile_library_view(client, include_hidden=False)
-    if not libraries:
-        notify("No visible libraries are available")
-        return
-    library_index = xbmcgui.Dialog().select(
-        "Choose Library",
-        [str(lib.get("name") or lib.get("title") or "Library") for lib in libraries],
-    )
-    if library_index < 0:
-        return
-    library = libraries[library_index]
-    try:
-        library_id = int(library.get("id"))
-    except (TypeError, ValueError):
-        notify("This library has an unsupported identifier")
-        return
-
-    if selected == 0:
-        item = {
-            "type": "library",
-            "library_id": library_id,
-            "label": str(library.get("name") or library.get("title") or "Library"),
+    item = None
+    if selected == 3:
+        collections, groups = client.collections()
+        group_names = {
+            str(group.get("id")): str(group.get("name") or "")
+            for group in (groups or [])
+            if isinstance(group, dict)
         }
-    elif selected == 1:
-        sections = client.library_sections(library_id)
-        sections = [
-            section for section in sections
-            if isinstance(section, dict) and section.get("id")
+        personal_collections = [
+            collection for collection in (collections or [])
+            if isinstance(collection, dict) and collection.get("id")
         ]
-        if not sections:
-            notify("This library has no sections")
+        if not personal_collections:
+            notify("There are no personal collections to pin")
             return
-        section_index = xbmcgui.Dialog().select(
-            "Choose Library Section",
-            [str(section.get("title") or section.get("section_type") or section.get("id")) for section in sections],
+        personal_index = xbmcgui.Dialog().select(
+            "Choose Personal Collection",
+            [
+                (
+                    "%s - %s" % (
+                        group_names.get(str(collection.get("group_id")), ""),
+                        collection.get("name") or collection.get("id"),
+                    )
+                    if group_names.get(str(collection.get("group_id")))
+                    else str(collection.get("name") or collection.get("id"))
+                )
+                for collection in personal_collections
+            ],
         )
-        if section_index < 0:
+        if personal_index < 0:
             return
-        section = sections[section_index]
-        item = {
-            "type": "section",
-            "library_id": library_id,
-            "section_id": str(section.get("id")),
-            "label": str(section.get("title") or section.get("section_type") or section.get("id")),
-        }
-    else:
-        data = client.library_collections(library_id)
-        collections = list(data.get("collections") or [])
-        for group in data.get("groups") or []:
-            collections.extend(group.get("collections") or [])
-        collections.extend((data.get("ungrouped") or {}).get("collections") or [])
-        seen = set()
-        unique = []
-        for collection in collections:
-            collection_id = str(collection.get("id") or "")
-            if collection_id and collection_id not in seen:
-                seen.add(collection_id)
-                unique.append(collection)
-        if not unique:
-            notify("This library has no collections")
-            return
-        collection_index = xbmcgui.Dialog().select(
-            "Choose Collection",
-            [str(collection.get("title") or collection.get("name") or collection.get("id")) for collection in unique],
-        )
-        if collection_index < 0:
-            return
-        collection = unique[collection_index]
+        collection = personal_collections[personal_index]
         item = {
             "type": "collection",
-            "library_id": library_id,
             "collection_id": str(collection.get("id")),
-            "label": str(collection.get("title") or collection.get("name") or collection.get("id")),
+            "label": str(collection.get("name") or collection.get("id")),
         }
+    else:
+        libraries, _disabled, _order = _profile_library_view(client, include_hidden=False)
+        if not libraries:
+            notify("No visible libraries are available")
+            return
+        library_index = xbmcgui.Dialog().select(
+            "Choose Library",
+            [str(lib.get("name") or lib.get("title") or "Library") for lib in libraries],
+        )
+        if library_index < 0:
+            return
+        library = libraries[library_index]
+        try:
+            library_id = int(library.get("id"))
+        except (TypeError, ValueError):
+            notify("This library has an unsupported identifier")
+            return
+
+        if selected == 0:
+            item = {
+                "type": "library",
+                "library_id": library_id,
+                "label": str(library.get("name") or library.get("title") or "Library"),
+            }
+        elif selected == 1:
+            sections = client.library_sections(library_id)
+            sections = [
+                section for section in sections
+                if isinstance(section, dict) and section.get("id")
+            ]
+            if not sections:
+                notify("This library has no sections")
+                return
+            section_index = xbmcgui.Dialog().select(
+                "Choose Library Section",
+                [
+                    str(section.get("title") or section.get("section_type") or section.get("id"))
+                    for section in sections
+                ],
+            )
+            if section_index < 0:
+                return
+            section = sections[section_index]
+            item = {
+                "type": "section",
+                "library_id": library_id,
+                "section_id": str(section.get("id")),
+                "label": str(section.get("title") or section.get("section_type") or section.get("id")),
+            }
+        else:
+            data = client.library_collections(library_id)
+            collections = list(data.get("collections") or [])
+            for group in data.get("groups") or []:
+                collections.extend(group.get("collections") or [])
+            collections.extend((data.get("ungrouped") or {}).get("collections") or [])
+            seen = set()
+            unique = []
+            for collection in collections:
+                collection_id = str(collection.get("id") or "")
+                if collection_id and collection_id not in seen:
+                    seen.add(collection_id)
+                    unique.append(collection)
+            if not unique:
+                notify("This library has no collections")
+                return
+            collection_index = xbmcgui.Dialog().select(
+                "Choose Library Collection",
+                [
+                    str(collection.get("title") or collection.get("name") or collection.get("id"))
+                    for collection in unique
+                ],
+            )
+            if collection_index < 0:
+                return
+            collection = unique[collection_index]
+            item = {
+                "type": "collection",
+                "library_id": library_id,
+                "collection_id": str(collection.get("id")),
+                "label": str(collection.get("title") or collection.get("name") or collection.get("id")),
+            }
 
     if any(
         existing.get("type") == item.get("type")
@@ -4249,7 +4291,6 @@ def _edit_navigation_shortcuts(client):
         xbmc.executebuiltin("Container.Refresh")
     except SiloError as exc:
         notify("Could not pin shortcut: %s" % str(exc)[:150])
-
 
 def add_profile_navigation_shortcuts(client):
     """Add profile-pinned Silo destinations to the KOLO root."""
