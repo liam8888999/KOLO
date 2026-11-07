@@ -3553,6 +3553,7 @@ PROFILE_SETTING_LABELS = {
     "playback.intro_skip_mode": "Skip intros",
     "playback.auto_skip_recap": "Auto-skip recaps",
     "playback.auto_skip_credits": "Auto-skip credits",
+    "playback.auto_play_next": "Auto-play next episode",
 }
 
 PROFILE_ENUMS = {
@@ -3782,6 +3783,7 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
         "playback.show_forced_subtitles",
         "playback.auto_skip_recap",
         "playback.auto_skip_credits",
+        "playback.auto_play_next",
     ):
         current_bool = bool(current) if current is not None else False
         selected = xbmcgui.Dialog().select(
@@ -3893,6 +3895,7 @@ def list_scoped_playback_preferences(client, scope, library_id=None, series_id=N
             "playback.intro_skip_mode",
             "playback.auto_skip_recap",
             "playback.auto_skip_credits",
+            "playback.auto_play_next",
         )
     else:
         keys = (
