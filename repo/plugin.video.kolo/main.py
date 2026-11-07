@@ -4049,18 +4049,11 @@ def _edit_library_visibility(client):
         index for index, library in enumerate(libraries)
         if _safe_int(library.get("id"), 0) not in disabled
     ]
-    try:
-        selected = xbmcgui.Dialog().multiselect(
-            "Visible Libraries (checked libraries appear in KOLO)",
-            labels,
-            preselect=preselected,
-        )
-    except TypeError:
-        selected = xbmcgui.Dialog().multiselect(
-            "Visible Libraries (checked libraries appear in KOLO)",
-            labels,
-            preselect=preselected,
-        )
+    selected = xbmcgui.Dialog().multiselect(
+        "Visible Libraries (checked libraries appear in KOLO)",
+        labels,
+        preselect=preselected,
+    )
     if selected is None:
         return
     visible = {
