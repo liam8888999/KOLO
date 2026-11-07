@@ -2987,7 +2987,10 @@ def list_search_results(client, query, page=1):
     # KOLO currently renders video catalog items; use video for its default
     # and all only when the profile explicitly requests a wider search.
     media_scope = _profile_setting(client, "search.media_scope", "video")
-    if media_scope not in ("video", "all", "audiobook"):
+    if media_scope == "audiobook":
+        notify("The active Silo profile is set to Audiobooks, but KOLO currently supports video playback only.")
+        media_scope = "video"
+    elif media_scope not in ("video", "all"):
         media_scope = "video"
 
     # Media and people searches are independent. Each client owns a
@@ -3035,7 +3038,11 @@ def list_search_results(client, query, page=1):
             xbmcplugin.endOfDirectory(HANDLE)
             return
 
-        items = data.get("items") or []
+        items = [
+            item for item in (data.get("items") or [])
+            if str(item.get("type") or item.get("media_type") or "").lower()
+            in ("movie", "series", "season", "episode")
+        ]
         has_more = bool(data.get("has_more"))
 
         try:
@@ -3302,7 +3309,6 @@ def list_search_results(client, query, page=1):
 PROFILE_SETTING_LABELS = {
     "ui.disabled_library_ids": "Hidden libraries",
     "ui.library_order": "Library order",
-    "home.hide_watched_items": "Hide watched items from Home",
     "ui.next_up_mode": "Next Up episodes",
     "ui.next_up_new_releases_first": "Show new episodes first",
     "search.media_scope": "Search scope",
@@ -3496,9 +3502,6 @@ def _profile_edit_item(client, key, description=None, scope="profile", library_i
     )
 
 
-# The temporary reference is set only while a preference directory is rendered.
-_ACTIVE_PREFS_CLIENT = None
-
 
 def _edit_profile_setting(client, key, scope="profile", library_id=None, series_id=None):
     key = str(key or "")
@@ -3534,21 +3537,20 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
         new_value = options[selected][0]
 
     elif key in (
-        "home.hide_watched_items",
         "ui.next_up_new_releases_first",
         "playback.show_forced_subtitles",
         "playback.auto_skip_recap",
         "playback.auto_skip_credits",
     ):
         current_bool = bool(current) if current is not None else False
-        new_value = xbmcgui.Dialog().yesno(
+        selected = xbmcgui.Dialog().select(
             PROFILE_SETTING_LABELS[key],
-            "Enable this preference?",
-            nolabel="Off",
-            yeslabel="On",
+            ["On", "Off", "Cancel"],
+            preselect=0 if current_bool else 1,
         )
-        # Kodi's yesno returns False for both No and Back. The explicit prompt
-        # is still a usable two-state switch; unchanged values remain harmless.
+        if selected < 0 or selected == 2:
+            return
+        new_value = selected == 0
         if current is not None and bool(new_value) == current_bool:
             return
 
@@ -3694,7 +3696,6 @@ def list_home_preferences(client):
     xbmcplugin.setPluginCategory(HANDLE, "Home & Search")
     xbmcplugin.setContent(HANDLE, "files")
     for key in (
-        "home.hide_watched_items",
         "ui.next_up_mode",
         "ui.next_up_new_releases_first",
         "search.media_scope",
