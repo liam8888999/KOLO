@@ -2001,8 +2001,8 @@ class SiloClient:
     # Search the profile-visible catalog across all accessible libraries.
     # Silo performs the search server-side, so the addon does not need to
     # download and scan every library itself.
-    def search_people(self, query, limit=20):
-        """Search profile-visible Silo people by name."""
+    def search_people(self, query, limit=20, media_scope=None):
+        """Search profile-visible Silo people by name and optional media scope."""
         query = str(query or "").strip()
         if not query:
             return []
@@ -2018,6 +2018,7 @@ class SiloClient:
             params={
                 "q": query,
                 "limit": limit,
+                **({"media_scope": media_scope} if media_scope and media_scope != "all" else {}),
             },
         ) or {}
 
@@ -2053,7 +2054,7 @@ class SiloClient:
             self._next(data),
         )
 
-    def search_catalog(self, query, limit=100, offset=0):
+    def search_catalog(self, query, limit=100, offset=0, media_scope=None):
         """Return one page of Silo's v2 server-side catalog search results.
 
         Keep the add-on's existing page/offset interface, but translate the
@@ -2082,6 +2083,10 @@ class SiloClient:
             "skip_total": "true",
             "image_size": "medium",
         }
+        if media_scope == "video":
+            params["type"] = "video"
+        elif media_scope == "audiobook":
+            params["type"] = "audiobook"
 
         # Silo v2 uses seek for a direct jump to the requested zero-based
         # result window. Page 1 naturally starts at position zero, so omit it.
@@ -2658,6 +2663,21 @@ class SiloClient:
         caps = self.playback_caps()
         pv = self._protocol_version()
         output_hdr_details = _kodi_output_hdr_details()
+
+        # Silo profile preferences are authoritative unless the caller supplied
+        # a concrete quality override. "Auto" remains the default behaviour,
+        # and Silo still chooses direct play whenever the source is suitable.
+        profile_values = self.effective_settings(
+            ["playback.preferred_quality", "playback.max_bitrate_kbps"]
+        )
+        preferred_quality = (
+            profile_values.get("playback.preferred_quality", {}).get("value")
+            if isinstance(profile_values.get("playback.preferred_quality"), dict)
+            else None
+        )
+        if quality_preference in (None, "", "auto") and preferred_quality:
+            quality_preference = preferred_quality
+
         quality_preference = str(quality_preference or "auto").strip()
         if quality_preference.lower() == "original":
             # The current API retains original only as a deprecated alias.
@@ -2844,6 +2864,21 @@ class SiloClient:
                 "deliveries": deliveries,
             },
         }
+
+        # The profile's maximum bitrate is a hard Silo delivery ceiling,
+        # independent of the resolution preference. It is sent in the v3 request
+        # contract as bandwidth_cap_kbps.
+        max_bitrate = (
+            profile_values.get("playback.max_bitrate_kbps", {}).get("value")
+            if isinstance(profile_values.get("playback.max_bitrate_kbps"), dict)
+            else None
+        )
+        try:
+            max_bitrate = int(max_bitrate) if max_bitrate is not None else None
+        except (TypeError, ValueError):
+            max_bitrate = None
+        if max_bitrate is not None and 100 <= max_bitrate <= 200000:
+            body["bandwidth_cap_kbps"] = max_bitrate
 
         # A measured probe is cached between playback starts. Never synthesize a
         # throughput estimate from the media recipe: Auto treats this field as a
