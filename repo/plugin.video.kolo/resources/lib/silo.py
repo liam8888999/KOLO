@@ -60,6 +60,8 @@ import xbmcaddon
 import xbmcgui
 import xbmcvfs
 
+from .playback_capabilities import kodi_original_http_validated_claims
+
 
 # Read addon metadata and determine where Kodi should store persistent configuration.
 ADDON = xbmcaddon.Addon()
@@ -2511,7 +2513,10 @@ class SiloClient:
 
 
     # Build a protocol-v3 playback/start request.
-    def _start_body(self, file_id, start_position=0.0, quality_preference="auto", direct_play_only=False):
+    def _start_body(
+        self, file_id, start_position=0.0, quality_preference="auto",
+        direct_play_only=False, kodi_source_version=None
+    ):
         caps = self.playback_caps()
         pv = self._protocol_version()
         output_hdr_details = _kodi_output_hdr_details()
@@ -2605,6 +2610,26 @@ class SiloClient:
             dict(delivery_template),
         )
         original_delivery.update(delivery_template)
+        # Only a file-specific, proven single-layer DV Profile 8 Main 10
+        # source can opt into Kodi-managed dynamic-range handling. The user
+        # does not have to guess whether their current platform can decode it:
+        # Kodi's own player will attempt the original stream and report failure.
+        original_delivery["validated_claims"] = kodi_original_http_validated_claims(
+            video, output_hdr_details, kodi_source_version
+        )
+        log(
+            "Original playback capabilities: HEVC=%s HDR10/HLG=%s "
+            "DV8 base-layer fallback=%s Kodi-managed DV8=%s"
+            % (
+                "hevc" in video,
+                bool(output_hdr_details and (
+                    output_hdr_details.get("hdr10") or output_hdr_details.get("hlg")
+                )),
+                "client_dv8_base_layer_fallback_v1" in original_delivery["validated_claims"],
+                "client_managed_dynamic_range_v1" in original_delivery["validated_claims"],
+            ),
+            xbmc.LOGDEBUG,
+        )
         deliveries["original_http"] = original_delivery
 
         progressive_delivery = deliveries.get(
@@ -2991,12 +3016,16 @@ class SiloClient:
         ]
 
     # Ask Silo for a playable stream URL using the supplied server-authoritative start position.
-    def start_playback(self, file_id, start_position=0.0, quality_preference="auto", direct_play_only=False):
+    def start_playback(
+        self, file_id, start_position=0.0, quality_preference="auto",
+        direct_play_only=False, kodi_source_version=None
+    ):
         body = self._start_body(
             file_id,
             start_position,
             quality_preference=quality_preference,
             direct_play_only=direct_play_only,
+            kodi_source_version=kodi_source_version,
         )
 
         data = self._json(            "POST",
@@ -3008,6 +3037,15 @@ class SiloClient:
 
         if not plan:
             terminal = data.get("terminal") or data.get("outcome")
+            if isinstance(terminal, dict):
+                log(
+                    "Silo playback terminal: reason=%s message=%s"
+                    % (
+                        terminal.get("reason") or "unknown",
+                        str(terminal.get("message") or "")[:240],
+                    ),
+                    xbmc.LOGWARNING,
+                )
             if (
                 direct_play_only
                 and isinstance(terminal, dict)
@@ -3031,6 +3069,32 @@ class SiloClient:
                 "Direct play only is enabled, but Silo selected %s delivery." %
                 (plan.get("delivery") or "an unsupported")
             )
+
+        transformations = [
+            item.get("name") or item.get("transformation") or "unknown"
+            for item in (plan.get("transformations") or [])
+            if isinstance(item, dict)
+        ]
+        degradation_codes = [
+            item.get("code") or "unknown"
+            for item in (plan.get("degradation_warnings") or [])
+            if isinstance(item, dict)
+        ]
+        source = plan.get("source") or {}
+        recipe = plan.get("effective_recipe") or {}
+        log(
+            "Silo playback plan: delivery=%s decision=%s source_range=%s "
+            "output_range=%s transformations=%s degradation=%s"
+            % (
+                plan.get("delivery") or "unknown",
+                plan.get("decision_reason") or "unknown",
+                source.get("dynamic_range") or "unknown",
+                recipe.get("dynamic_range") or "unknown",
+                ",".join(transformations) or "none",
+                ",".join(degradation_codes) or "none",
+            ),
+            xbmc.LOGINFO,
+        )
 
         stream = plan.get("stream") or {}
         url = self.abs_url(stream.get("url"))

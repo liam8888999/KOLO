@@ -52,6 +52,7 @@ import xbmcvfs
 import xbmcaddon
 
 from resources.lib.skipping import SkipTracker, segments as skip_segments
+from resources.lib.playback_capabilities import is_kodi_managed_dv8_source
 from resources.lib.silo import (
     SiloClient,
     SiloError,
@@ -286,6 +287,37 @@ def episode_display_label(title, episode_number):
         return title
 
     return "%d. %s" % (number, title)
+
+
+class _KoloPlaybackPlayer(xbmc.Player):
+    """Kodi player callback bridge used for automatic DV8 recovery."""
+
+    def __init__(self):
+        xbmc.Player.__init__(self)
+        self.playback_error_event = threading.Event()
+        self.av_started_event = threading.Event()
+
+    def onAVStarted(self):
+        self.av_started_event.set()
+        try:
+            hdr_type = str(xbmc.getInfoLabel("VideoPlayer.HdrType") or "").strip()
+            hdr_detail = str(xbmc.getInfoLabel("VideoPlayer.HdrDetail") or "").strip()
+        except Exception:
+            hdr_type = ""
+            hdr_detail = ""
+        log(
+            "Kodi opened media stream: HDR type=%s detail=%s"
+            % (hdr_type or "not reported", hdr_detail or "not reported"),
+            xbmc.LOGINFO,
+        )
+
+    def onPlayBackError(self):
+        self.playback_error_event.set()
+        log(
+            "Kodi reported a playback error; checking whether the active "
+            "Dolby Vision Profile 8 source can be replanned by Silo.",
+            xbmc.LOGWARNING,
+        )
 
 
 def direct_play_only_enabled():
@@ -8661,11 +8693,20 @@ def play(
     # Resume is implemented by Kodi seeking the resolved item to the fresh
     # Silo position, while Start from beginning receives no resume point.
     direct_play_only = direct_play_only_enabled()
+    source_version = _detail_version(detail, file_id) if isinstance(detail, dict) else None
+    kodi_dv8_source = is_kodi_managed_dv8_source(source_version, ["hevc"])
+    if kodi_dv8_source:
+        log(
+            "Kodi auto-play negotiation: proven single-layer Dolby Vision "
+            "Profile 8 Main 10 source; allowing Kodi to attempt original playback.",
+            xbmc.LOGINFO,
+        )
 
     info = client.start_playback(
         file_id,
         start_position=0.0,
         direct_play_only=direct_play_only,
+        kodi_source_version=source_version,
     )
 
     if not info.get("url"):
@@ -8848,6 +8889,10 @@ def play(
 
     resolved_item.setProperty("IsPlayable", "true")
 
+    # Register Kodi's player callbacks before the resolved URL is handed
+    # back. Startup decoder failures can happen before the progress monitor
+    # begins, so its callback object must already exist.
+    playback_player = _KoloPlaybackPlayer()
     xbmcplugin.setResolvedUrl(
         HANDLE,
         True,
@@ -8898,6 +8943,7 @@ def play(
             playback_info=info,
             resolved_item=resolved_item,
             force_start_zero=False,
+            playback_player=playback_player,
         )
     else:
         log(
@@ -8953,12 +8999,162 @@ def progress_retry_delay(exc, default_delay=5.0):
     return min(3600.0, max(1.0, delay))
 
 
+def _kolo_playback_url_key(value):
+    """Return a Kodi stream URL identity without volatile query/header data."""
+    raw = str(value or "").split("|", 1)[0].strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    return parsed._replace(query="", fragment="").geturl().rstrip("/")
+
+
+def _kolo_is_managed_dv8_original_plan(playback_info):
+    """True only while the active server plan is an original proven DV8 stream."""
+    plan = (playback_info or {}).get("playback_plan") or {}
+    source = plan.get("source") or {}
+    return (
+        str(plan.get("delivery") or "").strip().lower() == "original_http"
+        and str(source.get("dynamic_range") or "").strip().lower() == "dolby_vision"
+        and int(source.get("dolby_vision_profile") or 0) == 8
+        and source.get("dv_base_layer_proven") is True
+        and str(source.get("dv_enhancement_layer") or "").strip().lower() == "none"
+        and str(source.get("video_codec") or "").strip().lower() == "hevc"
+        and int(source.get("bit_depth") or 0) == 10
+    )
+
+
+def _kolo_replan_after_dv8_failure(
+    client, player, playback_info, resolved_item, position, failure_classification
+):
+    """Ask Silo for an adapted plan after Kodi rejects the original DV8 stream."""
+    if not _kolo_is_managed_dv8_original_plan(playback_info):
+        return False
+
+    old_url = str((playback_info or {}).get("url") or "")
+    try:
+        current_url = str(player.getPlayingFile() or "") if player.isPlaying() else ""
+    except Exception:
+        current_url = ""
+    current_key = _kolo_playback_url_key(current_url)
+    expected_key = _kolo_playback_url_key(old_url)
+    if current_key and expected_key and current_key != expected_key:
+        log(
+            "Skipping Dolby Vision fallback because Kodi has already switched "
+            "to another media item.",
+            xbmc.LOGWARNING,
+        )
+        return False
+
+    failure = {
+        "classification": str(failure_classification or "decoder_failure")[:64],
+        "message": (
+            "Kodi's native player could not start or continue the original "
+            "Dolby Vision Profile 8 stream; requesting an adapted Silo plan."
+        ),
+    }
+    try:
+        new_info = client.replan_playback(
+            playback_info,
+            max(0.0, float(position or 0.0)),
+            quality_preference="auto",
+            operation="failure_recovery",
+            failure=failure,
+        )
+    except Exception as exc:
+        log(
+            "Silo could not replan the failed Dolby Vision Profile 8 stream: %s" % exc,
+            xbmc.LOGWARNING,
+        )
+        return False
+
+    new_url = str(new_info.get("url") or "")
+    new_plan = new_info.get("playback_plan") or {}
+    if not new_url or str(new_plan.get("delivery") or "").lower() == "original_http":
+        log(
+            "Silo did not produce an adapted route after Kodi rejected the "
+            "Dolby Vision Profile 8 source (delivery=%s)."
+            % (new_plan.get("delivery") or "unknown"),
+            xbmc.LOGWARNING,
+        )
+        return False
+
+    timeline = new_plan.get("timeline") or {}
+    try:
+        start_offset = max(0.0, float(timeline.get("player_start_seconds") or 0.0))
+    except (TypeError, ValueError):
+        start_offset = max(0.0, float(position or 0.0))
+
+    list_item = resolved_item or xbmcgui.ListItem(path=new_url)
+    try:
+        list_item.setPath(new_url)
+    except Exception:
+        list_item = xbmcgui.ListItem(path=new_url)
+    list_item.setProperty("IsPlayable", "true")
+    list_item.setProperty("StartOffset", "%.3f" % start_offset)
+
+    player.playback_error_event.clear()
+    player.av_started_event.clear()
+    player.play(new_url, list_item)
+
+    expected_new_key = _kolo_playback_url_key(new_url)
+    attached = False
+    for _ in range(120):
+        if player.playback_error_event.is_set():
+            break
+        if player.isPlaying():
+            try:
+                actual_key = _kolo_playback_url_key(player.getPlayingFile())
+            except Exception:
+                actual_key = ""
+            if actual_key and actual_key == expected_new_key:
+                attached = True
+                break
+        xbmc.sleep(250)
+
+    if not attached:
+        log(
+            "Kodi did not attach Silo's adapted fallback stream after the "
+            "Dolby Vision playback failure.",
+            xbmc.LOGWARNING,
+        )
+        return False
+
+    private_state = {
+        key: value for key, value in (playback_info or {}).items()
+        if str(key).startswith("_silo_")
+    }
+    playback_info.clear()
+    playback_info.update(new_info)
+    playback_info.update(private_state)
+    playback_info["session_id"] = str(
+        new_info.get("session_id") or (new_plan.get("session_id") or "")
+    )
+    playback_info["adaptive_quality"] = "auto"
+
+    transformations = [
+        item.get("name") or item.get("transformation") or "unknown"
+        for item in (new_plan.get("transformations") or [])
+        if isinstance(item, dict)
+    ]
+    log(
+        "Kodi rejected the original DV8 stream; Silo fallback started: "
+        "delivery=%s transformations=%s"
+        % (
+            new_plan.get("delivery") or "unknown",
+            ",".join(transformations) or "none",
+        ),
+        xbmc.LOGINFO,
+    )
+    return True
+
+
 def track_progress(
     client,
     session_id,
     playback_info=None,
     resolved_item=None,
     force_start_zero=False,
+    playback_player=None,
 ):
     """Monitor Kodi playback, report progress, and learn a stable quality.
 
@@ -8974,7 +9170,7 @@ def track_progress(
     "auto" is Silo's source-preserving intent and sits above the fixed quality rungs.
     It is not repeatedly retried simply because playback has been healthy for 90 seconds.
     """
-    player = xbmc.Player()
+    player = playback_player or _KoloPlaybackPlayer()
     monitor = xbmc.Monitor()
 
     direct_play_only = direct_play_only_enabled()
@@ -8985,15 +9181,44 @@ def track_progress(
     if direct_play_only:
         log("Direct-play-only mode enabled; adaptive quality switching is disabled.")
 
-    # Wait for Kodi to actually begin playing the resolved stream.
+    # Wait for Kodi to actually begin playing the resolved stream. For a
+    # proven Profile 8 source, an immediate decoder error or a startup timeout
+    # triggers one Silo failure-recovery replan. The server then chooses the
+    # best executable remux/transcode route for this device.
+    startup_failure = None
     for _ in range(60):
         if player.isPlaying():
             break
-
+        if getattr(player, "playback_error_event", None) and player.playback_error_event.is_set():
+            startup_failure = "decoder_failure"
+            break
         if monitor.abortRequested():
             return
-
         xbmc.sleep(500)
+
+    if (
+        not player.isPlaying()
+        and _kolo_is_managed_dv8_original_plan(playback_info)
+        and not direct_play_only
+    ):
+        if startup_failure is None:
+            startup_failure = "startup_timeout"
+        recovered = _kolo_replan_after_dv8_failure(
+            client,
+            player,
+            playback_info,
+            resolved_item,
+            0.0,
+            startup_failure,
+        )
+        if recovered:
+            session_id = str(playback_info.get("session_id") or session_id)
+        else:
+            log(
+                "Kodi could not open the original Dolby Vision Profile 8 stream "
+                "and Silo did not provide a playable fallback.",
+                xbmc.LOGWARNING,
+            )
 
     if not player.isPlaying():
         log(
@@ -9001,6 +9226,9 @@ def track_progress(
             xbmc.LOGWARNING,
         )
         return
+
+    if getattr(player, "playback_error_event", None):
+        player.playback_error_event.clear()
 
     # Kodi can apply a resume bookmark from its local database after the
     # resolved URL has been opened. If Silo says there is no resume state but
@@ -9466,6 +9694,46 @@ def track_progress(
             break
 
         now = time.time()
+
+        if (
+            getattr(player, "playback_error_event", None)
+            and player.playback_error_event.is_set()
+            and _kolo_is_managed_dv8_original_plan(playback_info)
+            and not direct_play_only
+        ):
+            try:
+                error_position = max(0.0, float(player.getTime() or last_position))
+            except Exception:
+                error_position = max(0.0, float(last_position or 0.0))
+            recovered = _kolo_replan_after_dv8_failure(
+                client,
+                player,
+                playback_info,
+                resolved_item,
+                error_position,
+                "decoder_failure",
+            )
+            if recovered:
+                session_id = str(playback_info.get("session_id") or session_id)
+                last_position = error_position
+                last_observed_position = None
+                last_progress_position = None
+                last_progress_change_at = time.time()
+                progress_confirmed = False
+                healthy_since = 0.0
+                caching_started_at = None
+                stall_started_at = None
+                post_switch_grace_until = time.time() + 15.0
+                continue
+            log(
+                "Automatic Dolby Vision recovery failed; ending the original "
+                "playback monitor.",
+                xbmc.LOGWARNING,
+            )
+            break
+        elif getattr(player, "playback_error_event", None):
+            # A non-DV8 playback error is not eligible for this narrow fallback.
+            player.playback_error_event.clear()
 
         if skip_tracker is not None and not _watch_party_connection_active():
             try:

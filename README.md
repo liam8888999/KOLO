@@ -42,8 +42,10 @@ https://liam8888999.github.io/KOLO/
 * Adaptive quality switching uses the quality options published by Silo Server and can step down when sustained buffering is detected.
 * Optional **Only allow direct play** setting disables adaptive quality switching and rejects playback plans that require transcoding or HLS adaptation.
 * Report Kodi playback progress to Silo Server approximately every five seconds, so progress is shared with other clients.
+* Log Silo's playback decision reason, source/output dynamic range, selected transformations and degradation codes to make unexpected transcoding diagnosable.
 * Use the latest server-side resume position with Kodi's native Resume / Start from beginning prompt.
 * Report playback capabilities to Silo Server, including supported video/audio and display HDR details where Kodi exposes them, to help the server plan playback.
+* Automatically try Kodi's native player on proven, single-layer Dolby Vision Profile 8 Main 10 files, across supported platforms; if Kodi reports a decoder/startup playback error, replan through Silo's available remux/transcode routes. Other Dolby Vision profiles remain on Silo's normal capability-planned path.
 * Negotiate server-supported HLS subtitle renditions so compatible embedded text tracks can be offered by Kodi's native player.
 * Skip available intro, recap and credits segments. You can choose prompts or enable automatic skipping separately for intros, recaps and credits in the add-on settings.
 * Support server-side playback termination, which stops the active Kodi stream when Silo Server revokes or terminates its session.
