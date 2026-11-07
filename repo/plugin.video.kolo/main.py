@@ -3338,9 +3338,15 @@ PROFILE_ENUMS = {
 }
 
 
-def _profile_setting(client, key, default=None, force=False):
+def _profile_setting(client, key, default=None, force=False, library_id=None, series_id=None):
     try:
-        return client.setting_value(key, default, force=force)
+        return client.setting_value(
+            key,
+            default,
+            library_id=library_id,
+            series_id=series_id,
+            force=force,
+        )
     except SiloError as exc:
         log("Unable to read Silo profile setting %s: %s" % (key, exc), xbmc.LOGDEBUG)
         return default
@@ -3429,9 +3435,15 @@ def list_library_preferences(client):
     xbmcplugin.endOfDirectory(HANDLE)
 
 
-def _profile_edit_item(key, description=None):
+def _profile_edit_item(client, key, description=None, scope="profile", library_id=None, series_id=None):
     title = PROFILE_SETTING_LABELS.get(key, key)
-    current = _profile_setting(_ACTIVE_PREFS_CLIENT, key, None) if _ACTIVE_PREFS_CLIENT else None
+    current = _profile_setting(
+        client,
+        key,
+        None,
+        library_id=library_id,
+        series_id=series_id,
+    )
     if key in PROFILE_ENUMS:
         labels = dict(PROFILE_ENUMS[key])
         value_label = labels.get(str(current), "Server default")
@@ -3450,7 +3462,13 @@ def _profile_edit_item(key, description=None):
     item.setInfo("video", {"title": title, "plot": description or ""})
     xbmcplugin.addDirectoryItem(
         HANDLE,
-        build_url(action="edit_profile_setting", key=key),
+        build_url(
+            action="edit_profile_setting",
+            key=key,
+            scope=scope,
+            library_id=library_id,
+            series_id=series_id,
+        ),
         item,
         False,
     )
@@ -3460,12 +3478,21 @@ def _profile_edit_item(key, description=None):
 _ACTIVE_PREFS_CLIENT = None
 
 
-def _edit_profile_setting(client, key):
+def _edit_profile_setting(client, key, scope="profile", library_id=None, series_id=None):
     key = str(key or "")
     if key not in PROFILE_SETTING_LABELS:
         raise SiloError("Unsupported Silo profile preference.")
+    if scope not in ("profile", "profile_library", "profile_series"):
+        raise SiloError("Unsupported preference scope.")
 
-    current = _profile_setting(client, key, None, force=True)
+    current = _profile_setting(
+        client,
+        key,
+        None,
+        force=True,
+        library_id=library_id,
+        series_id=series_id,
+    )
     new_value = current
 
     if key in PROFILE_ENUMS:
@@ -3545,7 +3572,13 @@ def _edit_profile_setting(client, key):
         return
 
     try:
-        client.update_setting_value(key, new_value, scope="profile")
+        client.update_setting_value(
+            key,
+            new_value,
+            scope=scope,
+            library_id=library_id,
+            series_id=series_id,
+        )
         notify("%s saved" % PROFILE_SETTING_LABELS[key])
         xbmc.executebuiltin("Container.Refresh")
     except SiloError as exc:
@@ -3553,10 +3586,9 @@ def _edit_profile_setting(client, key):
 
 
 def list_playback_preferences(client):
-    global _ACTIVE_PREFS_CLIENT
-    _ACTIVE_PREFS_CLIENT = client
     xbmcplugin.setPluginCategory(HANDLE, "Playback Preferences")
     xbmcplugin.setContent(HANDLE, "files")
+    _profile_preferences_item("Library-specific audio and subtitle preferences", "choose_library_playback_preferences")
     for key in (
         "playback.audio_language",
         "playback.subtitle_language",
@@ -3571,12 +3603,68 @@ def list_playback_preferences(client):
         descriptions = {
             "playback.preferred_quality": "Silo still prefers direct playback whenever the selected source is suitable.",
             "playback.max_bitrate_kbps": "A hard server-side delivery ceiling, independent of resolution.",
-            "playback.audio_language": "Silo can also override this per library or series.",
-            "playback.subtitle_language": "Silo can also override this per library or series.",
+            "playback.audio_language": "Can be overridden separately for a library or series.",
+            "playback.subtitle_language": "Can be overridden separately for a library or series.",
         }
-        _profile_edit_item(key, descriptions.get(key))
+        _profile_edit_item(client, key, descriptions.get(key))
     xbmcplugin.endOfDirectory(HANDLE)
-    _ACTIVE_PREFS_CLIENT = None
+
+
+def list_scoped_playback_preferences(client, scope, library_id=None, series_id=None, title=None):
+    if scope not in ("profile_library", "profile_series"):
+        raise SiloError("Unsupported playback preference scope.")
+    xbmcplugin.setPluginCategory(HANDLE, title or "Playback Preferences")
+    xbmcplugin.setContent(HANDLE, "files")
+    context = {"library_id": library_id, "series_id": series_id}
+    for key in (
+        "playback.audio_language",
+        "playback.subtitle_language",
+        "playback.subtitle_mode",
+        "playback.show_forced_subtitles",
+    ):
+        _profile_edit_item(
+            client,
+            key,
+            "Overrides the profile-wide setting for this %s." % (
+                "library" if scope == "profile_library" else "series"
+            ),
+            scope=scope,
+            **context
+        )
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def choose_library_playback_preferences(client):
+    libraries, _disabled, _order = _profile_library_view(client, include_hidden=False)
+    if not libraries:
+        notify("No visible libraries are available")
+        return
+    selected = xbmcgui.Dialog().select(
+        "Choose Library",
+        [str(lib.get("name") or lib.get("title") or "Library") for lib in libraries],
+    )
+    if selected < 0:
+        return
+    library = libraries[selected]
+    list_scoped_playback_preferences(
+        client,
+        "profile_library",
+        library_id=library.get("id"),
+        title="%s Playback Preferences" % (library.get("name") or "Library"),
+    )
+
+
+def list_series_playback_preferences(client, series_id):
+    if not series_id:
+        raise SiloError("No series ID was supplied.")
+    detail = client.item_detail(series_id) or {}
+    title = detail.get("title") or detail.get("name") or "Series"
+    list_scoped_playback_preferences(
+        client,
+        "profile_series",
+        series_id=series_id,
+        title="%s Playback Preferences" % title,
+    )
 
 
 def list_home_preferences(client):
@@ -3604,6 +3692,7 @@ def list_metadata_preferences(client):
     xbmcplugin.setPluginCategory(HANDLE, "Metadata Preferences")
     xbmcplugin.setContent(HANDLE, "files")
     _profile_edit_item(
+        client,
         "catalog.metadata_language",
         "Fallback language for titles, descriptions and artwork. Blank uses the server/library default.",
     )
@@ -8302,6 +8391,18 @@ def list_library(client, library_id, cursor=None):
     xbmcplugin.setPluginCategory(HANDLE, "Library")
     xbmcplugin.setContent(HANDLE, "files")
 
+    playback_item = xbmcgui.ListItem(label="Library Playback Preferences")
+    playback_item.setArt({"icon": "DefaultAddonService.png"})
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_url(
+            action="library_playback_preferences",
+            library_id=library_id,
+        ),
+        playback_item,
+        True,
+    )
+
     for group in LIBRARY_LETTER_GROUPS:
         count = counts.get(group, 0)
         if not count:
@@ -11209,7 +11310,21 @@ def router(client):
         return
 
     if action == "edit_profile_setting":
-        _edit_profile_setting(client, params.get("key"))
+        _edit_profile_setting(
+            client,
+            params.get("key"),
+            scope=params.get("scope") or "profile",
+            library_id=params.get("library_id"),
+            series_id=params.get("series_id"),
+        )
+        return
+
+    if action == "choose_library_playback_preferences":
+        choose_library_playback_preferences(client)
+        return
+
+    if action == "series_playback_preferences":
+        list_series_playback_preferences(client, params.get("series_id"))
         return
 
     if action == "edit_metadata_language_overrides":
@@ -11419,6 +11534,15 @@ def router(client):
 
     if action == "library_sections":
         list_library_sections(client, params.get("library_id"))
+        return
+
+    if action == "library_playback_preferences":
+        list_scoped_playback_preferences(
+            client,
+            "profile_library",
+            library_id=params.get("library_id"),
+            title="Library Playback Preferences",
+        )
         return
 
     if action == "library_section":
