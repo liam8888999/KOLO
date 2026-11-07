@@ -3864,6 +3864,7 @@ def list_playback_preferences(client):
         "playback.intro_skip_mode",
         "playback.auto_skip_recap",
         "playback.auto_skip_credits",
+        "playback.auto_play_next",
     ):
         descriptions = {
             "playback.preferred_quality": "Silo still prefers direct playback whenever the selected source is suitable.",
@@ -9840,6 +9841,121 @@ def apply_fresh_resume_to_resolved_item(list_item, progress, fallback_duration=0
         tag.setResumePoint(0.0, 0.0)
 
 
+def next_unplayed_episode_queue_url(client, detail, library_id, current_content_id):
+    """Build a playable KOLO URL for the next available, unwatched episode.
+
+    The queued URL is a normal plugin:// item. Kodi resolves it only when the
+    queue advances, so the next episode gets its own Silo playback session and
+    the existing resume/progress logic remains in control.
+    """
+    if not isinstance(detail, dict):
+        return None
+    media_type = str(detail.get("type") or detail.get("media_type") or "").lower()
+    if media_type != "episode":
+        return None
+
+    series_id = str(detail.get("series_id") or "").strip()
+    if not series_id or not library_id:
+        return None
+    try:
+        current_season = int(detail.get("season_number"))
+        current_episode = int(detail.get("episode_number"))
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        seasons = client.seasons(series_id, library_id) or []
+    except SiloError as exc:
+        log("Unable to find the next episode season for %s: %s" % (series_id, exc), xbmc.LOGDEBUG)
+        return None
+
+    ordered_seasons = []
+    for season in seasons:
+        try:
+            number = int(season.get("season_number", season.get("number")))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if number >= current_season:
+            ordered_seasons.append((number, season))
+    ordered_seasons.sort(key=lambda entry: entry[0])
+
+    for season_number, _season in ordered_seasons:
+        try:
+            episodes = client.episodes(series_id, season_number, library_id) or []
+        except SiloError as exc:
+            log(
+                "Unable to retrieve episodes for %s season %s: %s"
+                % (series_id, season_number, exc),
+                xbmc.LOGDEBUG,
+            )
+            continue
+
+        ordered_episodes = []
+        for episode in episodes:
+            try:
+                episode_number = int(episode.get("episode_number"))
+                item_season = int(episode.get("season_number", season_number))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if (item_season, episode_number) <= (current_season, current_episode):
+                continue
+            ordered_episodes.append((item_season, episode_number, episode))
+        ordered_episodes.sort(key=lambda entry: (entry[0], entry[1]))
+
+        for item_season, episode_number, episode in ordered_episodes:
+            content_id = get_content_id(episode)
+            if not content_id or str(content_id) == str(current_content_id):
+                continue
+            user_data = episode.get("user_data") or {}
+            if bool(user_data.get("played")) or bool(user_data.get("completed")):
+                continue
+
+            try:
+                next_detail = client.item_detail(content_id, library_id)
+            except SiloError as exc:
+                log(
+                    "Unable to load next episode %s metadata: %s" % (content_id, exc),
+                    xbmc.LOGDEBUG,
+                )
+                continue
+
+            version = _detail_version(next_detail) if isinstance(next_detail, dict) else {}
+            file_id = version.get("file_id") or version.get("id")
+            if not file_id:
+                files = episode.get("files") or []
+                if files and isinstance(files[0], dict):
+                    file_id = files[0].get("id") or files[0].get("file_id")
+            if not file_id:
+                # Do not queue a missing/unplayable episode.
+                continue
+
+            duration = version.get("duration") or get_runtime_seconds(next_detail or {})
+            resume_available = False
+            try:
+                progress_position = float(
+                    user_data.get("position_seconds")
+                    or user_data.get("position")
+                    or 0
+                )
+                resume_available = progress_position > 0
+            except (TypeError, ValueError):
+                pass
+
+            params = {
+                "action": "play",
+                "content_id": content_id,
+                "file_id": file_id,
+                "library_id": library_id,
+                "resume_available": int(resume_available),
+            }
+            if duration:
+                params["duration_seconds"] = duration
+
+            return build_url(**params)
+
+    return None
+
+
 def play(
     client,
     content_id,
@@ -9944,6 +10060,23 @@ def play(
 
     if not info.get("url"):
         raise SiloError("Silo did not provide a playback URL.")
+
+    # Silo's next-episode setting is profile/device scoped. Prepare one next
+    # playable episode now; track_progress queues its plugin URL after Kodi has
+    # started the current item, and Kodi resolves the queued item when needed.
+    if isinstance(detail, dict) and _profile_setting_bool(
+        client,
+        "playback.auto_play_next",
+        True,
+    ):
+        next_url = next_unplayed_episode_queue_url(
+            client,
+            detail,
+            library_id,
+            content_id,
+        )
+        if next_url:
+            info["_kolo_next_episode_url"] = next_url
 
     resolved_item = xbmcgui.ListItem(path=info["url"])
 
@@ -10275,6 +10408,18 @@ def track_progress(
             xbmc.LOGWARNING,
         )
         return
+
+    next_episode_url = playback_info.get("_kolo_next_episode_url")
+    if next_episode_url and not _watch_party_connection_active():
+        # QueueMedia's playnext flag inserts the URL immediately after the
+        # active item in Kodi's video queue. The queued plugin item receives a
+        # separate main.py invocation and therefore a fresh Silo session.
+        queue_url = str(next_episode_url).replace('"', "%22").replace("\r", "").replace("\n", "")
+        try:
+            xbmc.executebuiltin('QueueMedia("%s",playnext)' % queue_url)
+            log("Queued the next unwatched episode in Kodi's playback queue.", xbmc.LOGINFO)
+        except Exception as exc:
+            log("Unable to queue the next Silo episode: %s" % exc, xbmc.LOGWARNING)
 
     # Kodi can apply a resume bookmark from its local database after the
     # resolved URL has been opened. If Silo says there is no resume state but
