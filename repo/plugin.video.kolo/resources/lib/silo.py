@@ -2104,8 +2104,8 @@ class SiloClient:
             "skip_total": "true",
             "image_size": "medium",
         }
-        if media_scope == "video":
-            params["type"] = "video"
+        if media_scope in ("video", "video_with_episodes"):
+            params["type"] = media_scope
         elif media_scope == "audiobook":
             params["type"] = "audiobook"
 
