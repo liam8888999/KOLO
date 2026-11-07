@@ -3263,6 +3263,782 @@ def list_search_results(client, query, page=1):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Silo profile preferences
+#
+# These preferences live in Silo, not in Kodi's local add-on settings. The
+# active profile therefore carries them between devices and Kodi installations.
+# Kodi-specific transport/display controls remain local.
+# ---------------------------------------------------------------------------
+
+PROFILE_SETTING_LABELS = {
+    "ui.disabled_library_ids": "Hidden libraries",
+    "ui.library_order": "Library order",
+    "home.hide_watched_items": "Hide watched items from Home",
+    "ui.next_up_mode": "Next Up episodes",
+    "ui.next_up_new_releases_first": "Show new episodes first",
+    "search.media_scope": "Search scope",
+    "catalog.metadata_language": "Metadata language",
+    "playback.audio_language": "Preferred audio language",
+    "playback.subtitle_language": "Preferred subtitle language",
+    "playback.subtitle_mode": "Subtitles",
+    "playback.show_forced_subtitles": "Show forced subtitles",
+    "playback.preferred_quality": "Preferred quality",
+    "playback.max_bitrate_kbps": "Maximum bitrate",
+    "playback.intro_skip_mode": "Skip intros",
+    "playback.auto_skip_recap": "Auto-skip recaps",
+    "playback.auto_skip_credits": "Auto-skip credits",
+}
+
+PROFILE_ENUMS = {
+    "ui.next_up_mode": [
+        ("combined", "With Continue Watching"),
+        ("separate", "Separate row"),
+    ],
+    "search.media_scope": [
+        ("video", "Movies and series"),
+        ("all", "Everything"),
+    ],
+    "playback.subtitle_mode": [
+        ("auto", "Auto"),
+        ("always", "Always on"),
+        ("off", "Off"),
+    ],
+    "playback.preferred_quality": [
+        ("auto", "Auto"),
+        ("480p", "480p"),
+        ("720p", "720p"),
+        ("1080p", "1080p"),
+        ("2160p", "2160p / 4K"),
+    ],
+    "playback.intro_skip_mode": [
+        ("never", "Never"),
+        ("ask", "Ask to skip"),
+        ("always", "Skip automatically"),
+    ],
+}
+
+
+def _profile_setting(client, key, default=None, force=False):
+    try:
+        return client.setting_value(key, default, force=force)
+    except SiloError as exc:
+        log("Unable to read Silo profile setting %s: %s" % (key, exc), xbmc.LOGDEBUG)
+        return default
+
+
+def _profile_setting_bool(client, key, default=False):
+    value = _profile_setting(client, key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _profile_id_list(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    result = []
+    seen = set()
+    for entry in value:
+        try:
+            item_id = int(entry)
+        except (TypeError, ValueError):
+            continue
+        if item_id > 0 and item_id not in seen:
+            seen.add(item_id)
+            result.append(item_id)
+    return result[:512]
+
+
+def _profile_library_view(client, include_hidden=False):
+    libraries = client.libraries(include_hidden=include_hidden)
+    disabled_ids = set(_profile_id_list(
+        _profile_setting(client, "ui.disabled_library_ids", [])
+    ))
+    order_ids = _profile_id_list(_profile_setting(client, "ui.library_order", []))
+    if not include_hidden:
+        libraries = [
+            library for library in libraries
+            if _safe_int(library.get("id"), 0) not in disabled_ids
+        ]
+    order = {library_id: index for index, library_id in enumerate(order_ids)}
+    libraries.sort(
+        key=lambda library: (
+            order.get(_safe_int(library.get("id"), 0), 1000000),
+            _safe_int(library.get("sort_order"), 1000000),
+            str(library.get("name") or "").casefold(),
+            _safe_int(library.get("id"), 0),
+        )
+    )
+    return libraries, disabled_ids, order_ids
+
+
+def _profile_preferences_item(label, action):
+    item = xbmcgui.ListItem(label=label)
+    item.setArt({"icon": "DefaultFolder.png"})
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_url(action=action),
+        item,
+        True,
+    )
+
+
+def list_profile_preferences(client):
+    xbmcplugin.setPluginCategory(HANDLE, "Silo Preferences")
+    xbmcplugin.setContent(HANDLE, "files")
+    _profile_preferences_item("Libraries & Navigation", "preferences_libraries")
+    _profile_preferences_item("Playback Preferences", "preferences_playback")
+    _profile_preferences_item("Home & Search", "preferences_home")
+    _profile_preferences_item("Metadata Preferences", "preferences_metadata")
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def list_library_preferences(client):
+    xbmcplugin.setPluginCategory(HANDLE, "Libraries & Navigation")
+    xbmcplugin.setContent(HANDLE, "files")
+    _profile_preferences_item("Choose Visible Libraries", "edit_library_visibility")
+    _profile_preferences_item("Set Library Order", "edit_library_order")
+    _profile_preferences_item("Manage Navigation Shortcuts", "edit_navigation_shortcuts")
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def _profile_edit_item(key, description=None):
+    title = PROFILE_SETTING_LABELS.get(key, key)
+    current = _profile_setting(_ACTIVE_PREFS_CLIENT, key, None) if _ACTIVE_PREFS_CLIENT else None
+    if key in PROFILE_ENUMS:
+        labels = dict(PROFILE_ENUMS[key])
+        value_label = labels.get(str(current), "Server default")
+    elif isinstance(current, bool):
+        value_label = "On" if current else "Off"
+    elif current is None:
+        value_label = "Server default"
+    elif key == "playback.max_bitrate_kbps":
+        value_label = "No cap" if current in (None, "", 0) else "%s kbps" % current
+    elif key in ("playback.audio_language", "playback.subtitle_language", "catalog.metadata_language"):
+        value_label = str(current or "No preference")
+    else:
+        value_label = str(current)
+    item = xbmcgui.ListItem(label="%s: %s" % (title, value_label))
+    item.setArt({"icon": "DefaultAddonService.png"})
+    item.setInfo("video", {"title": title, "plot": description or ""})
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_url(action="edit_profile_setting", key=key),
+        item,
+        False,
+    )
+
+
+# The temporary reference is set only while a preference directory is rendered.
+_ACTIVE_PREFS_CLIENT = None
+
+
+def _edit_profile_setting(client, key):
+    key = str(key or "")
+    if key not in PROFILE_SETTING_LABELS:
+        raise SiloError("Unsupported Silo profile preference.")
+
+    current = _profile_setting(client, key, None, force=True)
+    new_value = current
+
+    if key in PROFILE_ENUMS:
+        options = PROFILE_ENUMS[key]
+        labels = [label for _value, label in options]
+        current_index = next(
+            (i for i, (value, _label) in enumerate(options) if value == str(current)),
+            0,
+        )
+        selected = xbmcgui.Dialog().select(
+            PROFILE_SETTING_LABELS[key],
+            labels,
+            preselect=current_index,
+        )
+        if selected < 0:
+            return
+        new_value = options[selected][0]
+
+    elif key in (
+        "home.hide_watched_items",
+        "ui.next_up_new_releases_first",
+        "playback.show_forced_subtitles",
+        "playback.auto_skip_recap",
+        "playback.auto_skip_credits",
+    ):
+        current_bool = bool(current) if current is not None else False
+        new_value = xbmcgui.Dialog().yesno(
+            PROFILE_SETTING_LABELS[key],
+            "Enable this preference?",
+            nolabel="Off",
+            yeslabel="On",
+        )
+        # Kodi's yesno returns False for both No and Back. The explicit prompt
+        # is still a usable two-state switch; unchanged values remain harmless.
+        if current is not None and bool(new_value) == current_bool:
+            return
+
+    elif key in (
+        "playback.audio_language",
+        "playback.subtitle_language",
+        "catalog.metadata_language",
+    ):
+        current_text = "" if current is None else str(current)
+        entered = xbmcgui.Dialog().input(
+            "%s (BCP 47 language tag; blank clears)" % PROFILE_SETTING_LABELS[key],
+            defaultt=current_text,
+        )
+        if entered is None:
+            return
+        entered = str(entered).strip()
+        new_value = entered or None
+
+    elif key == "playback.max_bitrate_kbps":
+        current_text = "" if current is None else str(current)
+        entered = xbmcgui.Dialog().input(
+            "Maximum bitrate in kbps (blank for no cap)",
+            defaultt=current_text,
+            type=xbmcgui.INPUT_NUMERIC,
+        )
+        if entered is None:
+            return
+        entered = str(entered).strip()
+        if entered:
+            try:
+                new_value = int(entered)
+            except ValueError:
+                notify("Enter a bitrate in kbps")
+                return
+            if not 100 <= new_value <= 200000:
+                notify("Bitrate must be between 100 and 200000 kbps")
+                return
+        else:
+            new_value = None
+
+    else:
+        notify("This preference does not have a Kodi editor yet")
+        return
+
+    try:
+        client.update_setting_value(key, new_value, scope="profile")
+        notify("%s saved" % PROFILE_SETTING_LABELS[key])
+        xbmc.executebuiltin("Container.Refresh")
+    except SiloError as exc:
+        notify("Could not save preference: %s" % str(exc)[:150])
+
+
+def list_playback_preferences(client):
+    global _ACTIVE_PREFS_CLIENT
+    _ACTIVE_PREFS_CLIENT = client
+    xbmcplugin.setPluginCategory(HANDLE, "Playback Preferences")
+    xbmcplugin.setContent(HANDLE, "files")
+    for key in (
+        "playback.audio_language",
+        "playback.subtitle_language",
+        "playback.subtitle_mode",
+        "playback.show_forced_subtitles",
+        "playback.preferred_quality",
+        "playback.max_bitrate_kbps",
+        "playback.intro_skip_mode",
+        "playback.auto_skip_recap",
+        "playback.auto_skip_credits",
+    ):
+        descriptions = {
+            "playback.preferred_quality": "Silo still prefers direct playback whenever the selected source is suitable.",
+            "playback.max_bitrate_kbps": "A hard server-side delivery ceiling, independent of resolution.",
+            "playback.audio_language": "Silo can also override this per library or series.",
+            "playback.subtitle_language": "Silo can also override this per library or series.",
+        }
+        _profile_edit_item(key, descriptions.get(key))
+    xbmcplugin.endOfDirectory(HANDLE)
+    _ACTIVE_PREFS_CLIENT = None
+
+
+def list_home_preferences(client):
+    global _ACTIVE_PREFS_CLIENT
+    _ACTIVE_PREFS_CLIENT = client
+    xbmcplugin.setPluginCategory(HANDLE, "Home & Search")
+    xbmcplugin.setContent(HANDLE, "files")
+    for key in (
+        "home.hide_watched_items",
+        "ui.next_up_mode",
+        "ui.next_up_new_releases_first",
+        "search.media_scope",
+    ):
+        description = ""
+        if key == "ui.next_up_mode":
+            description = "Controls whether Next Up is grouped with Continue Watching or kept separate."
+        elif key == "ui.next_up_new_releases_first":
+            description = "Uses Silo's release detection when ordering Continue Watching and Next Up."
+        _profile_edit_item(key, description)
+    xbmcplugin.endOfDirectory(HANDLE)
+    _ACTIVE_PREFS_CLIENT = None
+
+
+def list_metadata_preferences(client):
+    xbmcplugin.setPluginCategory(HANDLE, "Metadata Preferences")
+    xbmcplugin.setContent(HANDLE, "files")
+    _profile_edit_item(
+        "catalog.metadata_language",
+        "Fallback language for titles, descriptions and artwork. Blank uses the server/library default.",
+    )
+    overrides = xbmcgui.ListItem(label="Metadata Language Exceptions")
+    overrides.setArt({"icon": "DefaultAddonService.png"})
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_url(action="edit_metadata_language_overrides"),
+        overrides,
+        False,
+    )
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def _edit_metadata_language_overrides(client):
+    current = _profile_setting(client, "catalog.metadata_language_overrides", {})
+    if not isinstance(current, dict):
+        current = {}
+    labels = [
+        "%s → %s" % (source, target)
+        for source, target in sorted(current.items())
+    ]
+    choices = ["Add / change an exception", "Remove an exception"] if labels else [
+        "Add an exception"
+    ]
+    choices.extend(labels)
+    selected = xbmcgui.Dialog().select("Metadata language exceptions", choices)
+    if selected < 0:
+        return
+    updated = dict(current)
+    if selected == 0:
+        source = xbmcgui.Dialog().input(
+            "Original language code (2-3 lowercase letters, e.g. ja)"
+        )
+        if not source:
+            return
+        source = str(source).strip().lower()
+        if not re.match(r"^[a-z]{2,3}$", source):
+            notify("Use a two- or three-letter original language code")
+            return
+        target = xbmcgui.Dialog().input(
+            "Metadata language tag (e.g. en, en-GB) or x-silo-original"
+        )
+        if not target:
+            return
+        target = str(target).strip()
+        updated[source] = target
+    else:
+        if choices[1] == "Remove an exception":
+            remove_index = selected - 2
+            key = sorted(current)[remove_index]
+            updated.pop(key, None)
+        else:
+            source = xbmcgui.Dialog().input(
+                "Original language code to change or remove",
+                defaultt="",
+            )
+            if not source:
+                return
+            source = str(source).strip().lower()
+            if source not in updated:
+                notify("No exception exists for %s" % source)
+                return
+            target = xbmcgui.Dialog().input(
+                "New language tag (blank removes)",
+                defaultt=str(updated[source]),
+            )
+            if target is None:
+                return
+            if str(target).strip():
+                updated[source] = str(target).strip()
+            else:
+                updated.pop(source, None)
+    try:
+        client.update_setting_value(
+            "catalog.metadata_language_overrides",
+            updated,
+            scope="profile",
+        )
+        notify("Metadata language exceptions saved")
+        xbmc.executebuiltin("Container.Refresh")
+    except SiloError as exc:
+        notify("Could not save metadata preferences: %s" % str(exc)[:150])
+
+
+def _edit_library_visibility(client):
+    libraries, _disabled, _order = _profile_library_view(client, include_hidden=True)
+    if not libraries:
+        notify("No libraries are available to configure")
+        return
+    disabled = set(_profile_id_list(
+        _profile_setting(client, "ui.disabled_library_ids", [])
+    ))
+    labels = [
+        str(library.get("name") or library.get("title") or "Library")
+        for library in libraries
+    ]
+    preselected = [
+        index for index, library in enumerate(libraries)
+        if _safe_int(library.get("id"), 0) not in disabled
+    ]
+    try:
+        selected = xbmcgui.Dialog().multiselect(
+            "Visible Libraries (checked libraries appear in KOLO)",
+            labels,
+            preselect=preselected,
+        )
+    except TypeError:
+        selected = xbmcgui.Dialog().multiselect(
+            "Visible Libraries (checked libraries appear in KOLO)",
+            labels,
+            preselect=preselected,
+        )
+    if selected is None:
+        return
+    visible = {
+        _safe_int(libraries[index].get("id"), 0)
+        for index in selected
+        if 0 <= index < len(libraries)
+    }
+    hidden = sorted(
+        _safe_int(library.get("id"), 0)
+        for library in libraries
+        if _safe_int(library.get("id"), 0) > 0
+        and _safe_int(library.get("id"), 0) not in visible
+    )
+    try:
+        client.update_setting_value("ui.disabled_library_ids", hidden, scope="profile")
+        notify("Library visibility saved")
+        xbmc.executebuiltin("Container.Refresh")
+    except SiloError as exc:
+        notify("Could not save library visibility: %s" % str(exc)[:150])
+
+
+def _edit_library_order(client):
+    libraries, _disabled, order_ids = _profile_library_view(client, include_hidden=True)
+    if len(libraries) < 2:
+        notify("At least two libraries are required to change their order")
+        return
+    remaining = list(libraries)
+    ordered = []
+    while remaining:
+        position = len(ordered) + 1
+        labels = [
+            str(library.get("name") or library.get("title") or "Library")
+            for library in remaining
+        ]
+        selected = xbmcgui.Dialog().select(
+            "Choose library for position %d of %d" % (position, len(libraries)),
+            labels,
+        )
+        if selected < 0:
+            if not ordered:
+                return
+            ordered.extend(remaining)
+            break
+        ordered.append(remaining.pop(selected))
+    ids = [
+        _safe_int(library.get("id"), 0)
+        for library in ordered
+        if _safe_int(library.get("id"), 0) > 0
+    ]
+    try:
+        client.update_setting_value("ui.library_order", ids, scope="profile")
+        notify("Library order saved")
+        xbmc.executebuiltin("Container.Refresh")
+    except SiloError as exc:
+        notify("Could not save library order: %s" % str(exc)[:150])
+
+
+def _shortcut_display(item):
+    if not isinstance(item, dict):
+        return "Unknown shortcut"
+    return str(item.get("label") or item.get("section_id") or item.get("collection_id") or "Shortcut")
+
+
+def _edit_navigation_shortcuts(client):
+    choices = [
+        "Pin a library",
+        "Pin a library section",
+        "Pin a collection",
+        "Remove a shortcut",
+    ]
+    selected = xbmcgui.Dialog().select("Navigation Shortcuts", choices)
+    if selected < 0:
+        return
+    shortcuts = client.navigation_shortcuts(force=True)
+
+    if selected == 3:
+        if not shortcuts:
+            notify("There are no pinned shortcuts")
+            return
+        remove_index = xbmcgui.Dialog().select(
+            "Remove Navigation Shortcut",
+            [_shortcut_display(item) for item in shortcuts],
+        )
+        if remove_index < 0:
+            return
+        try:
+            client.update_navigation_shortcut(shortcuts[remove_index], present=False)
+            notify("Shortcut removed")
+            xbmc.executebuiltin("Container.Refresh")
+        except SiloError as exc:
+            notify("Could not remove shortcut: %s" % str(exc)[:150])
+        return
+
+    libraries, _disabled, _order = _profile_library_view(client, include_hidden=False)
+    if not libraries:
+        notify("No visible libraries are available")
+        return
+    library_index = xbmcgui.Dialog().select(
+        "Choose Library",
+        [str(lib.get("name") or lib.get("title") or "Library") for lib in libraries],
+    )
+    if library_index < 0:
+        return
+    library = libraries[library_index]
+    try:
+        library_id = int(library.get("id"))
+    except (TypeError, ValueError):
+        notify("This library has an unsupported identifier")
+        return
+
+    if selected == 0:
+        item = {
+            "type": "library",
+            "library_id": library_id,
+            "label": str(library.get("name") or library.get("title") or "Library"),
+        }
+    elif selected == 1:
+        sections = client.library_sections(library_id)
+        sections = [
+            section for section in sections
+            if isinstance(section, dict) and section.get("id")
+        ]
+        if not sections:
+            notify("This library has no sections")
+            return
+        section_index = xbmcgui.Dialog().select(
+            "Choose Library Section",
+            [str(section.get("title") or section.get("section_type") or section.get("id")) for section in sections],
+        )
+        if section_index < 0:
+            return
+        section = sections[section_index]
+        item = {
+            "type": "section",
+            "library_id": library_id,
+            "section_id": str(section.get("id")),
+            "label": str(section.get("title") or section.get("section_type") or section.get("id")),
+        }
+    else:
+        data = client.library_collections(library_id)
+        collections = list(data.get("collections") or [])
+        for group in data.get("groups") or []:
+            collections.extend(group.get("collections") or [])
+        collections.extend((data.get("ungrouped") or {}).get("collections") or [])
+        seen = set()
+        unique = []
+        for collection in collections:
+            collection_id = str(collection.get("id") or "")
+            if collection_id and collection_id not in seen:
+                seen.add(collection_id)
+                unique.append(collection)
+        if not unique:
+            notify("This library has no collections")
+            return
+        collection_index = xbmcgui.Dialog().select(
+            "Choose Collection",
+            [str(collection.get("title") or collection.get("name") or collection.get("id")) for collection in unique],
+        )
+        if collection_index < 0:
+            return
+        collection = unique[collection_index]
+        item = {
+            "type": "collection",
+            "library_id": library_id,
+            "collection_id": str(collection.get("id")),
+            "label": str(collection.get("title") or collection.get("name") or collection.get("id")),
+        }
+
+    if any(
+        existing.get("type") == item.get("type")
+        and str(existing.get("library_id") or "") == str(item.get("library_id") or "")
+        and str(existing.get("section_id") or "") == str(item.get("section_id") or "")
+        and str(existing.get("collection_id") or "") == str(item.get("collection_id") or "")
+        for existing in shortcuts
+        if isinstance(existing, dict)
+    ):
+        notify("That destination is already pinned")
+        return
+    try:
+        client.update_navigation_shortcut(item, present=True)
+        notify("Navigation shortcut pinned")
+        xbmc.executebuiltin("Container.Refresh")
+    except SiloError as exc:
+        notify("Could not pin shortcut: %s" % str(exc)[:150])
+
+
+def add_profile_navigation_shortcuts(client):
+    """Add profile-pinned Silo destinations to the KOLO root."""
+    try:
+        shortcuts = client.navigation_shortcuts()
+    except SiloError as exc:
+        log("Unable to load profile navigation shortcuts: %s" % exc, xbmc.LOGDEBUG)
+        return
+    for shortcut in shortcuts:
+        if not isinstance(shortcut, dict):
+            continue
+        target_type = str(shortcut.get("type") or "")
+        label = str(shortcut.get("label") or "Pinned destination")
+        params = None
+        if target_type == "library":
+            params = {
+                "action": "library",
+                "library_id": shortcut.get("library_id"),
+            }
+        elif target_type == "section":
+            params = {
+                "action": "library_section",
+                "library_id": shortcut.get("library_id"),
+                "section_id": shortcut.get("section_id"),
+            }
+        elif target_type == "collection":
+            params = {
+                "action": "library_collection",
+                "library_id": shortcut.get("library_id"),
+                "collection_id": shortcut.get("collection_id"),
+                "title": label,
+            }
+        if not params:
+            continue
+        item = xbmcgui.ListItem(label=label)
+        item.setArt({"icon": "DefaultFolder.png"})
+        xbmcplugin.addDirectoryItem(
+            HANDLE,
+            build_url(**params),
+            item,
+            True,
+        )
+
+
+def list_library_sections(client, library_id):
+    if not library_id:
+        raise SiloError("No library ID was supplied.")
+    sections = client.library_sections(library_id)
+    xbmcplugin.setPluginCategory(HANDLE, "Library Sections")
+    xbmcplugin.setContent(HANDLE, "files")
+    for section in sections:
+        section_id = section.get("id")
+        if not section_id:
+            continue
+        title = section.get("title") or section.get("section_type") or section_id
+        item = xbmcgui.ListItem(label=str(title))
+        item.setArt({"icon": "DefaultFolder.png"})
+        xbmcplugin.addDirectoryItem(
+            HANDLE,
+            build_url(
+                action="library_section",
+                library_id=library_id,
+                section_id=section_id,
+                title=title,
+            ),
+            item,
+            True,
+        )
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def list_library_section(client, library_id, section_id, title=None):
+    if not library_id or not section_id:
+        raise SiloError("A library and section ID are required.")
+    data = client.library_section_items(library_id, section_id)
+    if isinstance(data, dict) and isinstance(data.get("section"), dict):
+        section = data["section"]
+        data = dict(data)
+        data.update({key: value for key, value in section.items() if key != "items"})
+        data.setdefault("items", section.get("items") or [])
+    data = dict(data or {})
+    annotated = []
+    for source_item in data.get("items") or []:
+        item = dict(source_item)
+        item["_silo_home_source_library_id"] = str(library_id)
+        annotated.append(item)
+    data["items"] = annotated
+    _render_catalog_items(
+        client,
+        data,
+        section_title=title or data.get("title") or "Library Section",
+    )
+
+
+def list_library_collections(client, library_id):
+    if not library_id:
+        raise SiloError("No library ID was supplied.")
+    data = client.library_collections(library_id)
+    collections = list(data.get("collections") or [])
+    for group in data.get("groups") or []:
+        collections.extend(group.get("collections") or [])
+    collections.extend((data.get("ungrouped") or {}).get("collections") or [])
+    seen = set()
+    xbmcplugin.setPluginCategory(HANDLE, "Library Collections")
+    xbmcplugin.setContent(HANDLE, "files")
+    for collection in collections:
+        collection_id = str(collection.get("id") or "")
+        if not collection_id or collection_id in seen:
+            continue
+        seen.add(collection_id)
+        title = collection.get("title") or collection.get("name") or collection_id
+        item = xbmcgui.ListItem(label=str(title))
+        set_art(
+            item,
+            client,
+            poster=collection.get("poster_url") or collection.get("poster"),
+            backdrop=collection.get("backdrop_url") or collection.get("backdrop"),
+        )
+        if not collection.get("poster_url") and not collection.get("poster"):
+            _directory_art(item, "folder-collections")
+        xbmcplugin.addDirectoryItem(
+            HANDLE,
+            build_url(
+                action="library_collection",
+                library_id=library_id,
+                collection_id=collection_id,
+                title=title,
+            ),
+            item,
+            True,
+        )
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def list_library_collection(client, library_id, collection_id, title=None, cursor=None):
+    if not library_id or not collection_id:
+        raise SiloError("A library and collection ID are required.")
+    data = client.library_collection_items(
+        library_id,
+        collection_id,
+        cursor=cursor,
+        limit=get_directory_page_size(),
+    )
+    data = dict(data or {})
+    items = data.get("items") or []
+    for item in items:
+        if isinstance(item, dict):
+            item["_silo_home_source_library_id"] = str(library_id)
+    _render_catalog_items(client, data, section_title=title or "Collection")
+
+
+def list_library_shortcut_dummy():
+    return
+
 def open_settings(client):
     """Open this add-on's Kodi settings dialog."""
     client.sync_settings()
