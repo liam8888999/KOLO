@@ -1663,7 +1663,7 @@ class SiloClient:
 
     # ---------------------------------------------------------------- profile settings
 
-    def effective_settings(self, keys, force=False):
+    def effective_settings(self, keys, library_ids=None, series_ids=None, force=False):
         """Resolve Silo settings for the active profile using the canonical v2 API.
 
         Results are cached briefly per client instance to avoid repeating the same
@@ -1673,7 +1673,14 @@ class SiloClient:
         if not normalized:
             return {}
 
-        cache_key = (str(self.cfg.get("profile_id") or ""), normalized)
+        library_ids = tuple(sorted(set(str(value) for value in (library_ids or []) if str(value))))
+        series_ids = tuple(sorted(set(str(value) for value in (series_ids or []) if str(value))))
+        cache_key = (
+            str(self.cfg.get("profile_id") or ""),
+            normalized,
+            library_ids,
+            series_ids,
+        )
         cached = self._settings_cache.get(cache_key)
         if not force and cached and time.time() - cached[0] < 20:
             return dict(cached[1])
@@ -1681,7 +1688,11 @@ class SiloClient:
         data = self._json(
             "GET",
             "/api/v2/settings/values/effective",
-            params={"keys": list(normalized)},
+            params={
+                "keys": list(normalized),
+                **({"library_ids": list(library_ids)} if library_ids else {}),
+                **({"series_ids": list(series_ids)} if series_ids else {}),
+            },
         ) or {}
 
         values = {}
@@ -1693,9 +1704,14 @@ class SiloClient:
         self._settings_cache[cache_key] = (time.time(), dict(values))
         return values
 
-    def setting_value(self, key, default=None, force=False):
+    def setting_value(self, key, default=None, library_id=None, series_id=None, force=False):
         """Return one effective setting value, including its Silo default."""
-        item = self.effective_settings([key], force=force).get(str(key))
+        item = self.effective_settings(
+            [key],
+            library_ids=[library_id] if library_id is not None else None,
+            series_ids=[series_id] if series_id else None,
+            force=force,
+        ).get(str(key))
         return item.get("value", default) if isinstance(item, dict) else default
 
     def update_setting_value(self, key, value, scope="profile", library_id=None, series_id=None):
