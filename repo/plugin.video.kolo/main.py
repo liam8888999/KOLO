@@ -1714,6 +1714,223 @@ def _detail_version(detail, file_id=None):
     return best or (versions[0] if versions else {})
 
 
+def _normalise_track_language(value):
+    """Normalize language tags for the lightweight Kodi track-preference matcher."""
+    value = str(value or "").strip().lower().replace("_", "-")
+    if not value or value in ("und", "unknown", "x-silo-original", "original"):
+        return ""
+    aliases = {
+        "eng": "en", "fre": "fr", "fra": "fr", "ger": "de", "deu": "de",
+        "spa": "es", "ita": "it", "por": "pt", "jpn": "ja", "kor": "ko",
+        "chi": "zh", "zho": "zh", "dut": "nl", "nld": "nl", "rus": "ru",
+        "ara": "ar", "hin": "hi", "heb": "he", "swe": "sv", "nor": "no",
+        "dan": "da", "fin": "fi", "pol": "pl", "tur": "tr", "tha": "th",
+        "vie": "vi", "ukr": "uk", "ces": "cs", "cze": "cs", "ell": "el",
+        "gre": "el", "ron": "ro", "rum": "ro", "hun": "hu", "ind": "id",
+    }
+    parts = value.split("-")
+    parts[0] = aliases.get(parts[0], parts[0])
+    return "-".join(parts)
+
+
+def _track_language_rank(candidate, preferred):
+    candidate_tag = _normalise_track_language(candidate)
+    preferred_tag = _normalise_track_language(preferred)
+    if not candidate_tag or not preferred_tag:
+        return -1
+    if candidate_tag == preferred_tag:
+        return 0
+    if candidate_tag.split("-", 1)[0] != preferred_tag.split("-", 1)[0]:
+        return -1
+    return 2 if "-" in candidate_tag else 1
+
+
+def _track_matches_signature(track, signature):
+    if not isinstance(signature, dict):
+        return False
+    return (
+        str(track.get("source") or "").lower()
+        == str(signature.get("source") or "").lower()
+        and str(track.get("language") or "").lower()
+        == str(signature.get("language") or "").lower()
+        and str(track.get("codec") or "").lower()
+        == str(signature.get("codec") or "").lower()
+        and (
+            not signature.get("label")
+            or str(track.get("label") or "").lower()
+            == str(signature.get("label") or "").lower()
+        )
+        and bool(track.get("forced")) == bool(signature.get("forced"))
+        and bool(track.get("hearing_impaired"))
+        == bool(signature.get("hearing_impaired"))
+    )
+
+
+def _subtitle_track_priority(track):
+    codec = str(track.get("codec") or "").lower()
+    bitmap = codec in (
+        "hdmv_pgs_subtitle",
+        "pgssub",
+        "dvd_subtitle",
+        "dvb_subtitle",
+        "dvb_teletext",
+        "xsub",
+    )
+    source = str(track.get("source") or "embedded").lower()
+    source_rank = {"embedded": 0, "external": 1, "downloaded": 2}.get(source, 0)
+    return (
+        (32 if bitmap else 0)
+        + (16 if track.get("forced") else 0)
+        + (8 if track.get("hearing_impaired") else 0)
+        + source_rank
+    )
+
+
+def _select_preferred_subtitle_index(
+    tracks,
+    mode,
+    preferred_language,
+    signature,
+    audio_language,
+    show_forced,
+):
+    """Mirror Silo's auto subtitle selection priorities for the chosen file."""
+    if not tracks:
+        return None
+
+    def best_for_language(candidates, language):
+        best = None
+        best_rank = 3
+        best_priority = 10 ** 6
+        for track in candidates:
+            rank = _track_language_rank(track.get("language"), language)
+            priority = _subtitle_track_priority(track)
+            if rank < 0:
+                continue
+            if rank < best_rank or (rank == best_rank and priority < best_priority):
+                best = track
+                best_rank = rank
+                best_priority = priority
+        return best
+
+    def forced_for_audio():
+        if not show_forced or not audio_language:
+            return None
+        return best_for_language(
+            [track for track in tracks if track.get("forced")],
+            audio_language,
+        )
+
+    mode = str(mode or "auto").strip().lower()
+    preferred = str(preferred_language or "").strip()
+    if mode == "off":
+        return (forced_for_audio() or {}).get("index")
+
+    if mode == "always":
+        if isinstance(signature, dict):
+            exact = next(
+                (track for track in tracks if _track_matches_signature(track, signature)),
+                None,
+            )
+            if exact is not None:
+                return exact.get("index")
+        if not preferred:
+            return None
+        return (best_for_language(tracks, preferred) or {}).get("index")
+
+    if mode == "auto":
+        if preferred == "":
+            return None
+        if not preferred or (
+            _normalise_track_language(audio_language)
+            and _normalise_track_language(audio_language).split("-", 1)[0]
+            == _normalise_track_language(preferred).split("-", 1)[0]
+        ):
+            return (forced_for_audio() or {}).get("index")
+        return (best_for_language(tracks, preferred) or {}).get("index")
+
+    return None
+
+
+def _preferred_playback_track_indexes(detail, file_id=None):
+    """Return the audio/subtitle ordinals Silo's effective item preferences select."""
+    detail = detail if isinstance(detail, dict) else {}
+    version = _detail_version(detail, file_id) or {}
+    audio_index = version.get("effective_audio_track_index")
+    if audio_index is None:
+        audio_index = detail.get("effective_audio_track_index")
+
+    try:
+        audio_index = int(audio_index) if audio_index is not None else None
+    except (TypeError, ValueError):
+        audio_index = None
+
+    audio_tracks = version.get("audio_tracks") or []
+    audio_language = (
+        version.get("effective_audio_language")
+        or detail.get("effective_audio_language")
+    )
+    if not audio_language and audio_index is not None:
+        for audio_track in audio_tracks:
+            try:
+                index = int(audio_track.get("index", audio_track.get("stream_index", -1)))
+            except (TypeError, ValueError):
+                continue
+            if index == audio_index:
+                audio_language = audio_track.get("language")
+                break
+
+    source_tracks = version.get("subtitle_tracks") or []
+    # Playback v3's stable subtitle ordinals put sidecar/external files before
+    # embedded streams. They are not the file's raw FFmpeg stream indexes.
+    ordered = (
+        [track for track in source_tracks if track.get("external")]
+        + [track for track in source_tracks if not track.get("external")]
+    )
+    tracks = []
+    for index, track in enumerate(ordered):
+        tracks.append({
+            "index": index,
+            "language": track.get("language") or "",
+            "codec": track.get("codec") or "",
+            "label": (
+                track.get("title")
+                or track.get("embedded_title")
+                or track.get("file_name")
+                or track.get("language")
+                or "Subtitle %d" % (index + 1)
+            ),
+            "source": "external" if track.get("external") else "embedded",
+            "forced": bool(track.get("forced")),
+            "hearing_impaired": bool(track.get("hearing_impaired")),
+        })
+
+    subtitle_mode = detail.get("effective_subtitle_mode") or "auto"
+    subtitle_language = detail.get("effective_subtitle_language")
+    if subtitle_language is None:
+        subtitle_language = None
+    signature = detail.get("effective_subtitle_track_signature")
+    show_forced = detail.get("effective_show_forced_subtitles")
+    if show_forced is None:
+        show_forced = True
+
+    subtitle_index = _select_preferred_subtitle_index(
+        tracks,
+        subtitle_mode,
+        subtitle_language,
+        signature,
+        audio_language,
+        bool(show_forced),
+    )
+    if subtitle_index is not None:
+        try:
+            subtitle_index = int(subtitle_index)
+        except (TypeError, ValueError):
+            subtitle_index = None
+
+    return audio_index, subtitle_index
+
+
 def _aspect_ratio(value):
     """Convert Silo's aspect ratio into Kodi's numeric float form."""
     if value in (None, ""):
