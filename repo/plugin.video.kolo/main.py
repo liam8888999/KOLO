@@ -3553,8 +3553,6 @@ PROFILE_SETTING_LABELS = {
     "playback.intro_skip_mode": "Skip intros",
     "playback.auto_skip_recap": "Auto-skip recaps",
     "playback.auto_skip_credits": "Auto-skip credits",
-    "playback.auto_play_next": "Auto-play next episode",
-    "playback.next_up_prompt_seconds": "Next episode prompt (seconds)",
 }
 
 PROFILE_ENUMS = {
@@ -3705,6 +3703,8 @@ def _profile_edit_item(client, key, description=None, scope="profile", library_i
         value_label = labels.get(str(current), "Server default")
     elif isinstance(current, bool):
         value_label = "On" if current else "Off"
+    elif key == "search.media_scope" and current == "audiobook":
+        value_label = "Audiobooks (not supported by KOLO)"
     elif current is None:
         value_label = "Server default"
     elif key == "playback.max_bitrate_kbps":
@@ -3782,7 +3782,6 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
         "playback.show_forced_subtitles",
         "playback.auto_skip_recap",
         "playback.auto_skip_credits",
-        "playback.auto_play_next",
     ):
         current_bool = bool(current) if current is not None else False
         selected = xbmcgui.Dialog().select(
@@ -3810,14 +3809,10 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
             return
         new_value = str(entered).strip()
 
-    elif key in ("playback.max_bitrate_kbps", "playback.next_up_prompt_seconds"):
+    elif key == "playback.max_bitrate_kbps":
         current_text = "" if current is None else str(current)
         entered = xbmcgui.Dialog().input(
-            (
-                "Maximum bitrate in kbps (blank for no cap)"
-                if key == "playback.max_bitrate_kbps"
-                else "Seconds before the episode ends (0-120)"
-            ),
+            "Maximum bitrate in kbps (blank for no cap)",
             defaultt=current_text,
             type=xbmcgui.INPUT_NUMERIC,
         )
@@ -3830,19 +3825,11 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
             except ValueError:
                 notify("Enter a bitrate in kbps")
                 return
-            if key == "playback.max_bitrate_kbps":
-                if not 100 <= new_value <= 200000:
-                    notify("Bitrate must be between 100 and 200000 kbps")
-                    return
-            elif not 0 <= new_value <= 120:
-                notify("Prompt must be between 0 and 120 seconds")
+            if not 100 <= new_value <= 200000:
+                notify("Bitrate must be between 100 and 200000 kbps")
                 return
         else:
-            if key == "playback.max_bitrate_kbps":
-                new_value = None
-            else:
-                notify("Enter 0 to disable the next episode prompt")
-                return
+            new_value = None
 
     else:
         notify("This preference does not have a Kodi editor yet")
@@ -3905,8 +3892,6 @@ def list_scoped_playback_preferences(client, scope, library_id=None, series_id=N
             "playback.intro_skip_mode",
             "playback.auto_skip_recap",
             "playback.auto_skip_credits",
-            "playback.auto_play_next",
-            "playback.next_up_prompt_seconds",
         )
     else:
         keys = (
@@ -4270,6 +4255,9 @@ def add_profile_navigation_shortcuts(client):
     """Add profile-pinned Silo destinations to the KOLO root."""
     try:
         shortcuts = client.navigation_shortcuts()
+        hidden_ids = set(_profile_id_list(
+            _profile_setting(client, "ui.disabled_library_ids", [])
+        ))
     except SiloError as exc:
         log("Unable to load profile navigation shortcuts: %s" % exc, xbmc.LOGDEBUG)
         return
@@ -4278,6 +4266,12 @@ def add_profile_navigation_shortcuts(client):
             continue
         target_type = str(shortcut.get("type") or "")
         label = str(shortcut.get("label") or "Pinned destination")
+        shortcut_library_id = shortcut.get("library_id")
+        if (
+            shortcut_library_id not in (None, "")
+            and _safe_int(shortcut_library_id, 0) in hidden_ids
+        ):
+            continue
         params = None
         if target_type == "library":
             params = {
