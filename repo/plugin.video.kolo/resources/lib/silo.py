@@ -419,6 +419,7 @@ class SiloClient:
         self.session = requests.Session()
         self._caps = None
         self._catalog_search_caps = None
+        self._settings_cache = {}
         self._last_refresh_status = None
         self._last_refresh_problem = {}
         self._last_refresh_transient = False
@@ -456,6 +457,7 @@ class SiloClient:
             for key in ("token", "refresh_token", "profile_id", "profile_token", "bandwidth_estimate_cache"):
                 self.cfg.pop(key, None)
             self._caps = None
+            self._settings_cache = {}
 
         self.cfg["server"] = server if server else self.cfg.get("server", "")
         self.cfg["username"] = username if username else self.cfg.get("username", "")
@@ -1659,16 +1661,111 @@ class SiloClient:
         page = (data or {}).get("page") or {}
         return page.get("next_cursor") if page.get("has_more") else None
 
-    # Return every library visible to the current profile. API pagination is hidden from Kodi.
-    def libraries(self):
+    # ---------------------------------------------------------------- profile settings
+
+    def effective_settings(self, keys, force=False):
+        """Resolve Silo settings for the active profile using the canonical v2 API.
+
+        Results are cached briefly per client instance to avoid repeating the same
+        settings read while Kodi builds a directory or starts playback.
+        """
+        normalized = tuple(sorted(set(str(key).strip() for key in (keys or []) if str(key).strip())))
+        if not normalized:
+            return {}
+
+        cache_key = (str(self.cfg.get("profile_id") or ""), normalized)
+        cached = self._settings_cache.get(cache_key)
+        if not force and cached and time.time() - cached[0] < 20:
+            return dict(cached[1])
+
+        data = self._json(
+            "GET",
+            "/api/v2/settings/values/effective",
+            params={"keys": list(normalized)},
+        ) or {}
+
+        values = {}
+        for item in data.get("items", []) or []:
+            if not isinstance(item, dict) or not item.get("key"):
+                continue
+            values[str(item["key"])] = item
+
+        self._settings_cache[cache_key] = (time.time(), dict(values))
+        return values
+
+    def setting_value(self, key, default=None, force=False):
+        """Return one effective setting value, including its Silo default."""
+        item = self.effective_settings([key], force=force).get(str(key))
+        return item.get("value", default) if isinstance(item, dict) else default
+
+    def update_setting_value(self, key, value, scope="profile", library_id=None, series_id=None):
+        """Write one typed setting through Silo v2 and invalidate effective values."""
+        params = {"scope": str(scope or "profile")}
+        if library_id is not None:
+            params["library_id"] = str(library_id)
+        if series_id:
+            params["series_id"] = str(series_id)
+
+        data = self._json(
+            "PUT",
+            "/api/v2/settings/values/%s" % quote(str(key), safe=""),
+            params=params,
+            body={"value": value},
+        ) or {}
+        self._settings_cache.clear()
+        return data
+
+    def delete_setting_value(self, key, scope="profile", library_id=None, series_id=None):
+        """Remove an explicit setting row so Silo's inherited value applies again."""
+        params = {"scope": str(scope or "profile")}
+        if library_id is not None:
+            params["library_id"] = str(library_id)
+        if series_id:
+            params["series_id"] = str(series_id)
+
+        data = self._json(
+            "DELETE",
+            "/api/v2/settings/values/%s" % quote(str(key), safe=""),
+            params=params,
+        ) or {}
+        self._settings_cache.clear()
+        return data
+
+    def navigation_shortcuts(self, force=False):
+        """Return the active profile's library, section and collection shortcuts."""
+        value = self.setting_value("nav.shortcuts", {"items": []}, force=force)
+        return value.get("items", []) if isinstance(value, dict) else []
+
+    def update_navigation_shortcut(self, item, present=True):
+        """Atomically add or remove one nav.shortcuts item (whole-document PUT is refused)."""
+        if not isinstance(item, dict):
+            raise SiloError("A navigation shortcut must be an object.")
+
+        data = self._json(
+            "PUT",
+            "/api/v2/settings/values/nav.shortcuts/item",
+            body={"item": item, "present": bool(present)},
+        ) or {}
+        self._settings_cache.clear()
+        return data
+
+    # Return every library visible to the active profile. include_hidden is
+    # reserved for preference screens that need to restore a library the user hid.
+    def libraries(self, include_hidden=False):
         libraries = []
         cursor = None
 
         while True:
+            params = {}
+            if cursor:
+                params["cursor"] = cursor
+            if include_hidden:
+                params["include_hidden"] = "true"
+
             data = self._json(
                 "GET",
                 "/api/v2/user/libraries",
-                params={"cursor": cursor} if cursor else None,
+                params=params or None,
             ) or {}
 
             libraries.extend(data.get("items", []))
@@ -1676,6 +1773,52 @@ class SiloClient:
             cursor = self._next(data)
             if not cursor:
                 return libraries
+
+    def library_sections(self, library_id, image_size="medium"):
+        """Return the profile-visible sections configured inside one library."""
+        data = self._json(
+            "GET",
+            "/api/v2/library/%s/sections" % quote(str(library_id), safe=""),
+            params={"image_size": image_size},
+        ) or {}
+        return data.get("sections", [])
+
+    def library_section_items(self, library_id, section_id, image_size="medium"):
+        """Return the cards in one library section."""
+        return self._json(
+            "GET",
+            "/api/v2/library/%s/sections/%s/items"
+            % (quote(str(library_id), safe=""), quote(str(section_id), safe="")),
+            params={"image_size": image_size},
+        ) or {}
+
+    def library_collections(self, library_id):
+        """Return collections belonging to one library."""
+        data = self._json(
+            "GET",
+            "/api/v2/library/%s/collections" % quote(str(library_id), safe=""),
+        ) or {}
+        return data.get("collections", [])
+
+    def library_collection_items(self, library_id, collection_id, cursor=None, limit=100):
+        """Return one page of a library collection."""
+        params = {"limit": max(1, min(int(limit or 100), 200))}
+        if cursor:
+            params["cursor"] = cursor
+        return self._json(
+            "GET",
+            "/api/v2/library/%s/collections/%s/items"
+            % (quote(str(library_id), safe=""), quote(str(collection_id), safe="")),
+            params=params,
+        ) or {}
+
+    def library_user_collections(self, library_id):
+        """Return profile-owned collections associated with a library."""
+        data = self._json(
+            "GET",
+            "/api/v2/library/%s/user-collections" % quote(str(library_id), safe=""),
+        ) or {}
+        return data.get("items", [])
 
     # Return the profile-wide Home sections. These combine content across
     # all libraries visible to the selected profile.
