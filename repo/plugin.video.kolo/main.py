@@ -3101,7 +3101,7 @@ def add_catalog_context_menu(list_item, catalog_item):
         if series_id:
             parent_params["series_id"] = series_id
 
-            if media_type in ("episode", "season"):
+        if media_type in ("episode", "season"):
             parent_label = "Open parent show"
         else:
             parent_label = "Open parent library"
