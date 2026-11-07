@@ -3836,6 +3836,7 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
 def list_playback_preferences(client):
     xbmcplugin.setPluginCategory(HANDLE, "Playback Preferences")
     xbmcplugin.setContent(HANDLE, "files")
+    _profile_preferences_item("This Kodi device overrides", "device_playback_preferences")
     _profile_preferences_item("Library-specific audio and subtitle preferences", "choose_library_playback_preferences")
     for key in (
         "playback.audio_language",
@@ -3859,17 +3860,31 @@ def list_playback_preferences(client):
 
 
 def list_scoped_playback_preferences(client, scope, library_id=None, series_id=None, title=None):
-    if scope not in ("profile_library", "profile_series"):
+    if scope not in ("profile_device", "profile_library", "profile_series"):
         raise SiloError("Unsupported playback preference scope.")
     xbmcplugin.setPluginCategory(HANDLE, title or "Playback Preferences")
     xbmcplugin.setContent(HANDLE, "files")
     context = {"library_id": library_id, "series_id": series_id}
-    for key in (
-        "playback.audio_language",
-        "playback.subtitle_language",
-        "playback.subtitle_mode",
-        "playback.show_forced_subtitles",
-    ):
+    if scope == "profile_device":
+        keys = (
+            "playback.audio_language",
+            "playback.subtitle_language",
+            "playback.subtitle_mode",
+            "playback.show_forced_subtitles",
+            "playback.preferred_quality",
+            "playback.max_bitrate_kbps",
+            "playback.intro_skip_mode",
+            "playback.auto_skip_recap",
+            "playback.auto_skip_credits",
+        )
+    else:
+        keys = (
+            "playback.audio_language",
+            "playback.subtitle_language",
+            "playback.subtitle_mode",
+            "playback.show_forced_subtitles",
+        )
+    for key in keys:
         _profile_edit_item(
             client,
             key,
@@ -4251,12 +4266,19 @@ def add_profile_navigation_shortcuts(client):
                 "section_id": shortcut.get("section_id"),
             }
         elif target_type == "collection":
-            params = {
-                "action": "library_collection",
-                "library_id": shortcut.get("library_id"),
-                "collection_id": shortcut.get("collection_id"),
-                "title": label,
-            }
+            if shortcut.get("library_id") not in (None, ""):
+                params = {
+                    "action": "library_collection",
+                    "library_id": shortcut.get("library_id"),
+                    "collection_id": shortcut.get("collection_id"),
+                    "title": label,
+                }
+            else:
+                params = {
+                    "action": "collection",
+                    "collection_id": shortcut.get("collection_id"),
+                    "title": label,
+                }
         if not params:
             continue
         item = xbmcgui.ListItem(label=label)
@@ -8991,6 +9013,18 @@ def list_seasons(client, series_id, library_id, page=None):
         page=page,
     )
 
+    series_preferences = xbmcgui.ListItem(label="Series Playback Preferences")
+    series_preferences.setArt({"icon": "DefaultAddonService.png"})
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_url(
+            action="series_playback_preferences",
+            series_id=series_id,
+        ),
+        series_preferences,
+        True,
+    )
+
     for season in page_items:
         season_number = season.get("season_number", season.get("number"))
         if season_number is None:
@@ -9828,10 +9862,24 @@ def play(
     # Silo position, while Start from beginning receives no resume point.
     direct_play_only = direct_play_only_enabled()
 
+    audio_track_index, subtitle_track_index = _preferred_playback_track_indexes(
+        detail,
+        file_id=file_id,
+    ) if isinstance(detail, dict) else (None, None)
+
+    if audio_track_index is not None or subtitle_track_index is not None:
+        log(
+            "Applying Silo playback track preferences: audio=%s subtitle=%s"
+            % (audio_track_index, subtitle_track_index),
+            xbmc.LOGDEBUG,
+        )
+
     info = client.start_playback(
         file_id,
         start_position=0.0,
         direct_play_only=direct_play_only,
+        audio_track_index=audio_track_index,
+        subtitle_track_index=subtitle_track_index,
     )
 
     if not info.get("url"):
@@ -11568,6 +11616,14 @@ def router(client):
 
     if action == "choose_library_playback_preferences":
         choose_library_playback_preferences(client)
+        return
+
+    if action == "device_playback_preferences":
+        list_scoped_playback_preferences(
+            client,
+            "profile_device",
+            title="This Kodi Device Overrides",
+        )
         return
 
     if action == "series_playback_preferences":
