@@ -548,6 +548,11 @@ class SiloClient:
         h = {
             "Accept": "application/json",
             "X-Device-ID": device_id,
+            # Canonical settings API uses the Silo-prefixed device header when
+            # resolving profile_device overrides. Keep both IDs identical.
+            "X-Silo-Device-Id": device_id,
+            "X-Silo-Device-Name": "Kodi",
+            "X-Silo-Device-Platform": "Kodi",
             "X-Client-Name": "plugin.video.kolo",
             "X-Client-Version": ADDON_VERSION,
             "X-Client-Platform": "kodi",
@@ -2675,7 +2680,15 @@ class SiloClient:
 
 
     # Build a protocol-v3 playback/start request.
-    def _start_body(self, file_id, start_position=0.0, quality_preference="auto", direct_play_only=False):
+    def _start_body(
+        self,
+        file_id,
+        start_position=0.0,
+        quality_preference="auto",
+        direct_play_only=False,
+        audio_track_index=None,
+        subtitle_track_index=None,
+    ):
         caps = self.playback_caps()
         pv = self._protocol_version()
         output_hdr_details = _kodi_output_hdr_details()
@@ -2886,6 +2899,22 @@ class SiloClient:
                 "deliveries": deliveries,
             },
         }
+
+        # Track ordinals are calculated from Silo's item-detail response using
+        # the same sidecar-first / embedded-second order as the official player.
+        # The server validates these against the chosen file before planning.
+        for field, value in (
+            ("audio_track_index", audio_track_index),
+            ("subtitle_track_index", subtitle_track_index),
+        ):
+            if value is None:
+                continue
+            try:
+                index = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index <= 255:
+                body[field] = index
 
         # The profile's maximum bitrate is a hard Silo delivery ceiling,
         # independent of the resolution preference. It is sent in the v3 request
@@ -3207,12 +3236,22 @@ class SiloClient:
         ]
 
     # Ask Silo for a playable stream URL using the supplied server-authoritative start position.
-    def start_playback(self, file_id, start_position=0.0, quality_preference="auto", direct_play_only=False):
+    def start_playback(
+        self,
+        file_id,
+        start_position=0.0,
+        quality_preference="auto",
+        direct_play_only=False,
+        audio_track_index=None,
+        subtitle_track_index=None,
+    ):
         body = self._start_body(
             file_id,
             start_position,
             quality_preference=quality_preference,
             direct_play_only=direct_play_only,
+            audio_track_index=audio_track_index,
+            subtitle_track_index=subtitle_track_index,
         )
 
         data = self._json(            "POST",
