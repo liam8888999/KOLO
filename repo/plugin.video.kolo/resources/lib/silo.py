@@ -60,6 +60,8 @@ import xbmcaddon
 import xbmcgui
 import xbmcvfs
 
+from .playback_capabilities import kodi_original_http_validated_claims
+
 
 # Read addon metadata and determine where Kodi should store persistent configuration.
 ADDON = xbmcaddon.Addon()
@@ -2605,6 +2607,26 @@ class SiloClient:
             dict(delivery_template),
         )
         original_delivery.update(delivery_template)
+        # Kodi's display HDR label does not expose Dolby Vision profile/level
+        # support, so never invent native DV profile claims. It does provide
+        # enough evidence for Silo's narrower Profile 8 base-layer path:
+        # KOLO declares HEVC decode support above and only enables this claim
+        # when the active output explicitly reports HDR10 or HLG.
+        original_delivery["validated_claims"] = kodi_original_http_validated_claims(
+            video, output_hdr_details
+        )
+        log(
+            "Original playback capabilities: HEVC=%s HDR10/HLG=%s "
+            "DV8 base-layer fallback=%s; native DV profiles=not declared"
+            % (
+                "hevc" in video,
+                bool(output_hdr_details and (
+                    output_hdr_details.get("hdr10") or output_hdr_details.get("hlg")
+                )),
+                bool(original_delivery["validated_claims"]),
+            ),
+            xbmc.LOGDEBUG,
+        )
         deliveries["original_http"] = original_delivery
 
         progressive_delivery = deliveries.get(

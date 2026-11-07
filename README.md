@@ -44,6 +44,7 @@ https://liam8888999.github.io/KOLO/
 * Report Kodi playback progress to Silo Server approximately every five seconds, so progress is shared with other clients.
 * Use the latest server-side resume position with Kodi's native Resume / Start from beginning prompt.
 * Report playback capabilities to Silo Server, including supported video/audio and display HDR details where Kodi exposes them, to help the server plan playback.
+* Allow compatible Dolby Vision Profile 8 files to play through their HDR10/HLG-compatible base layer when KOLO declares HEVC support and Kodi reports the matching output range; native DV profiles are never guessed.
 * Negotiate server-supported HLS subtitle renditions so compatible embedded text tracks can be offered by Kodi's native player.
 * Skip available intro, recap and credits segments. You can choose prompts or enable automatic skipping separately for intros, recaps and credits in the add-on settings.
 * Support server-side playback termination, which stops the active Kodi stream when Silo Server revokes or terminates its session.
