@@ -3732,7 +3732,7 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
     key = str(key or "")
     if key not in PROFILE_SETTING_LABELS:
         raise SiloError("Unsupported Silo profile preference.")
-    if scope not in ("profile", "profile_library", "profile_series"):
+    if scope not in ("profile", "profile_device", "profile_library", "profile_series"):
         raise SiloError("Unsupported preference scope.")
 
     current = _profile_setting(
@@ -3786,7 +3786,7 @@ def _edit_profile_setting(client, key, scope="profile", library_id=None, series_
     ):
         current_text = "" if current is None else str(current)
         entered = xbmcgui.Dialog().input(
-            "%s (BCP 47 language tag)" % PROFILE_SETTING_LABELS[key],
+            "%s (BCP 47 tag; audio also accepts x-silo-original)" % PROFILE_SETTING_LABELS[key],
             defaultt=current_text,
         )
         if not entered:
