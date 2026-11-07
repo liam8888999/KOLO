@@ -16,6 +16,7 @@ sys.path.insert(0, str(PLUGIN_LIB))
 
 from playback_capabilities import (  # noqa: E402
     CLIENT_DV8_BASE_LAYER_FALLBACK,
+    CLIENT_MANAGED_DYNAMIC_RANGE,
     kodi_original_http_validated_claims,
 )
 
@@ -68,6 +69,35 @@ class KodiOriginalHTTPClaimsTests(unittest.TestCase):
             [CLIENT_DV8_BASE_LAYER_FALLBACK],
             kodi_original_http_validated_claims(
                 [" HEVC "], {"hdr10": True}
+            ),
+        )
+
+    def test_managed_dynamic_range_is_opt_in_and_requires_hevc(self):
+        self.assertEqual(
+            [],
+            kodi_original_http_validated_claims(
+                ["hevc"], None, client_manages_dynamic_range=False
+            ),
+        )
+        self.assertEqual(
+            [CLIENT_MANAGED_DYNAMIC_RANGE],
+            kodi_original_http_validated_claims(
+                ["hevc"], None, client_manages_dynamic_range=True
+            ),
+        )
+        self.assertEqual(
+            [],
+            kodi_original_http_validated_claims(
+                ["h264"], None, client_manages_dynamic_range=True
+            ),
+        )
+
+    def test_managed_dynamic_range_can_coexist_with_profile8_fallback(self):
+        self.assertEqual(
+            [CLIENT_DV8_BASE_LAYER_FALLBACK, CLIENT_MANAGED_DYNAMIC_RANGE],
+            kodi_original_http_validated_claims(
+                ["hevc"], {"hdr10": True},
+                client_manages_dynamic_range=True,
             ),
         )
 
