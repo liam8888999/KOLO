@@ -2683,9 +2683,15 @@ class SiloClient:
         # Silo profile preferences are authoritative unless the caller supplied
         # a concrete quality override. "Auto" remains the default behaviour,
         # and Silo still chooses direct play whenever the source is suitable.
-        profile_values = self.effective_settings(
-            ["playback.preferred_quality", "playback.max_bitrate_kbps"]
-        )
+        try:
+            profile_values = self.effective_settings(
+                ["playback.preferred_quality", "playback.max_bitrate_kbps"]
+            )
+        except SiloError as exc:
+            # Older v2 servers may predate the Settings Values operations.
+            # Keep playback working with the historical Auto behaviour there.
+            log("Silo profile playback preferences unavailable: %s" % exc, xbmc.LOGDEBUG)
+            profile_values = {}
         preferred_quality = (
             profile_values.get("playback.preferred_quality", {}).get("value")
             if isinstance(profile_values.get("playback.preferred_quality"), dict)
@@ -3005,6 +3011,14 @@ class SiloClient:
         if bandwidth_estimate_kbps is not None:
             body["bandwidth_estimate_kbps"] = bandwidth_estimate_kbps
 
+        try:
+            max_bitrate = self.setting_value("playback.max_bitrate_kbps", None)
+            max_bitrate = int(max_bitrate) if max_bitrate is not None else None
+        except (SiloError, TypeError, ValueError):
+            max_bitrate = None
+        if max_bitrate is not None and 100 <= max_bitrate <= 200000:
+            body["bandwidth_cap_kbps"] = max_bitrate
+
         data = self._json(
             "POST",
             "/api/v2/playback/%s/replan" % session_id,
@@ -3117,6 +3131,14 @@ class SiloClient:
             estimate = self.cached_bandwidth_estimate_kbps()
             if estimate is not None:
                 body["bandwidth_estimate_kbps"] = estimate
+
+        try:
+            max_bitrate = self.setting_value("playback.max_bitrate_kbps", None)
+            max_bitrate = int(max_bitrate) if max_bitrate is not None else None
+        except (SiloError, TypeError, ValueError):
+            max_bitrate = None
+        if max_bitrate is not None and 100 <= max_bitrate <= 200000:
+            body["bandwidth_cap_kbps"] = max_bitrate
 
         data = self._json(
             "POST",
