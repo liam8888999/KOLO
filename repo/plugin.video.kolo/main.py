@@ -3376,6 +3376,14 @@ def _profile_setting_bool(client, key, default=False):
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _safe_int(value, default=0):
+    """Convert API identifiers/order fields to integers without breaking UI rendering."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
 def _profile_id_list(value):
     if isinstance(value, str):
         try:
