@@ -2974,6 +2974,13 @@ def list_search_results(client, query, page=1):
     search_page_size = min(get_directory_page_size(), SEARCH_PAGE_SIZE)
     offset = (page_number - 1) * search_page_size
 
+    # Search respects the active profile's Silo media-scope preference.
+    # KOLO currently renders video catalog items; use video for its default
+    # and all only when the profile explicitly requests a wider search.
+    media_scope = _profile_setting(client, "search.media_scope", "video")
+    if media_scope not in ("video", "all", "audiobook"):
+        media_scope = "video"
+
     # Media and people searches are independent. Each client owns a
     # separate requests.Session so concurrent requests do not share session state.
     people_client = SiloClient()
@@ -2987,16 +2994,22 @@ def list_search_results(client, query, page=1):
             query,
             limit=search_page_size,
             offset=offset,
+            media_scope=media_scope,
         )
         people_future = executor.submit(
             people_client.search_people,
             query,
             limit=50,
+            media_scope=media_scope,
         )
-        box_sets_future = executor.submit(
-            box_sets_client.search_box_sets,
-            query,
-            limit=10,
+        box_sets_future = (
+            executor.submit(
+                box_sets_client.search_box_sets,
+                query,
+                limit=10,
+            )
+            if media_scope != "audiobook"
+            else None
         )
 
         try:
@@ -3008,7 +3021,8 @@ def list_search_results(client, query, page=1):
             )
             notify("Search failed: %s" % str(exc)[:180])
             people_future.cancel()
-            box_sets_future.cancel()
+            if box_sets_future is not None:
+                box_sets_future.cancel()
             xbmcplugin.endOfDirectory(HANDLE)
             return
 
@@ -3024,13 +3038,16 @@ def list_search_results(client, query, page=1):
             )
             people = []
 
-        try:
-            box_sets = box_sets_future.result() or []
-        except SiloError as exc:
-            log(
-                "Silo Box Set search failed for %r: %s" % (query, exc),
-                xbmc.LOGWARNING,
-            )
+        if box_sets_future is not None:
+            try:
+                box_sets = box_sets_future.result() or []
+            except SiloError as exc:
+                log(
+                    "Silo Box Set search failed for %r: %s" % (query, exc),
+                    xbmc.LOGWARNING,
+                )
+                box_sets = []
+        else:
             box_sets = []
 
     log(
@@ -10214,11 +10231,27 @@ def track_progress(
     known_good_quality = playback_info["adaptive_quality"]
     known_good_since = time.time()
 
+    # Silo's profile preferences take precedence. Older servers or accounts
+    # without these rows fall back to the existing Kodi-local controls.
+    intro_mode = _profile_setting(client, "playback.intro_skip_mode", None)
     auto_skip = {
-        "intro": ADDON.getSettingBool("auto_skip_intro"),
-        "recap": ADDON.getSettingBool("auto_skip_recap"),
-        "credits": ADDON.getSettingBool("auto_skip_credits"),
+        "intro": (
+            intro_mode == "always"
+            if intro_mode in ("never", "ask", "always")
+            else ADDON.getSettingBool("auto_skip_intro")
+        ),
+        "recap": _profile_setting_bool(
+            client,
+            "playback.auto_skip_recap",
+            ADDON.getSettingBool("auto_skip_recap"),
+        ),
+        "credits": _profile_setting_bool(
+            client,
+            "playback.auto_skip_credits",
+            ADDON.getSettingBool("auto_skip_credits"),
+        ),
     }
+    skip_never = {"intro"} if intro_mode == "never" else set()
     skip_tracker = None
     if ADDON.getSettingBool("skip_segments_enabled"):
         spans = playback_info.get("_silo_skip_spans") or []
@@ -10287,6 +10320,10 @@ def track_progress(
                 skip_span = skip_tracker.observe(skip_position)
                 if skip_span:
                     kind = str(skip_span.get("kind") or "")
+                    if kind in skip_never:
+                        # "Never" consumes the marker without prompting or
+                        # seeking, so it will not repeatedly trigger in a loop.
+                        continue
                     label = {
                         "intro": "Skip Intro",
                         "recap": "Skip Recap",
