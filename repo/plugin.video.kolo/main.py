@@ -9247,7 +9247,10 @@ def play(
     # before onPlayBackEnded() has been dispatched. In the session-less path
     # this also keeps the Python callback owner alive for the duration of the
     # media item.
-    natural_end = _wait_for_natural_playback_end(playback_player)
+    natural_end = _wait_for_natural_playback_end(
+        playback_player,
+        startup_timeout=30.0 if not session_id else 0.0,
+    )
 
     if (
         auto_play_next_episode_enabled()
