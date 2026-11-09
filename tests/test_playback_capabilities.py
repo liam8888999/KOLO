@@ -59,13 +59,13 @@ class DolbyVisionMetadataTests(unittest.TestCase):
     def test_profile_7_is_identified_but_not_client_base_layer_fallback(self):
         item = source(7, compat_id=6, enhancement="fel", el_present=True)
         info = dolby_vision_source_info(item)
-        self.assertEqual(info["strategy"], "silo_profile7_conversion_or_transcode")
+        self.assertEqual(info["strategy"], "kodi_native_dolby_vision_attempt_with_silo_recovery")
         self.assertFalse(info["kodi_base_layer_candidate"])
         self.assertEqual([], kodi_original_http_validated_claims(["hevc"], {"hdr10": True}, item))
 
     def test_profile_5_does_not_claim_hdr10_base_layer(self):
         info = dolby_vision_source_info(source(5, compat_id=0))
-        self.assertEqual(info["strategy"], "silo_profile5_tonemap_or_transcode")
+        self.assertEqual(info["strategy"], "kodi_native_dolby_vision_attempt_with_silo_recovery")
         self.assertFalse(info["kodi_base_layer_candidate"])
 
     def test_legacy_and_other_profiles_are_reported_without_false_claims(self):
@@ -99,6 +99,26 @@ class DolbyVisionMetadataTests(unittest.TestCase):
     def test_hlg_base_layer_claim_requires_hlg_output(self):
         claims = kodi_original_http_validated_claims(["hevc"], {"hlg": True}, source(8, compat_id=4))
         self.assertIn(CLIENT_DV8_BASE_LAYER_FALLBACK, claims)
+
+
+    def test_all_recognised_profiles_get_native_attempt_claim(self):
+        cases = (
+            (0, "hevc", 10, "Main 10"),
+            (4, "hevc", 10, "Main 10"),
+            (5, "hevc", 10, "Main 10"),
+            (7, "hevc", 10, "Main 10"),
+            (8, "hevc", 10, "Main 10"),
+            (9, "h264", 8, "High"),
+            (10, "av1", 10, "Main 10"),
+            (20, "hevc", 10, "Main 10"),
+        )
+        for profile, codec, depth, video_profile in cases:
+            with self.subTest(profile=profile):
+                item = source(profile, codec, depth, video_profile, compat_id=0)
+                claims = kodi_original_http_validated_claims(
+                    ["h264", "hevc", "av1"], {"hdr10": False}, item
+                )
+                self.assertIn(CLIENT_MANAGED_DYNAMIC_RANGE, claims)
 
     def test_missing_codec_or_unknown_output_fails_closed(self):
         self.assertEqual([], kodi_original_http_validated_claims(["av1"], None, source(8)))
