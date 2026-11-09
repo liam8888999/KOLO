@@ -149,12 +149,14 @@ def dolby_vision_source_info(source_version, video_codecs=None):
         and video_profile == "main10"
     )
 
-    if profile == 7:
-        strategy = "silo_profile7_conversion_or_transcode"
+    if kodi_base_layer_candidate:
+        strategy = "kodi_native_dolby_vision_attempt_with_silo_recovery"
+    elif profile == 7:
+        strategy = "kodi_native_dolby_vision_attempt_with_silo_recovery"
     elif profile == 5:
-        strategy = "silo_profile5_tonemap_or_transcode"
-    elif profile == 8 and kodi_base_layer_candidate:
-        strategy = "kodi_profile8_base_layer_with_silo_recovery"
+        strategy = "kodi_native_dolby_vision_attempt_with_silo_recovery"
+    elif profile is not None:
+        strategy = "kodi_native_dolby_vision_attempt_with_silo_recovery"
     else:
         strategy = "silo_profile_aware_adaptation"
 
@@ -192,20 +194,29 @@ def kodi_original_http_validated_claims(
     active output range to match that base layer.
     """
     codecs = {_normalise_codec(codec) for codec in (video_codecs or ())}
-    if "hevc" not in codecs:
-        return []
-
     info = dolby_vision_source_info(source_version, codecs)
-    if not info or not info.get("kodi_base_layer_candidate"):
+    if not info:
         return []
 
+    source_codec = _normalise_codec(info.get("codec"))
+    if not source_codec or source_codec not in codecs:
+        return []
+
+    # This claim tells Silo that Kodi's native player is allowed to receive
+    # the original HDR/Dolby Vision stream and resolve its presentation. It is
+    # intentionally profile-agnostic: Kodi attempts the original and reports
+    # decoder/startup failure, at which point KOLO requests a Silo fallback.
     claims = [CLIENT_MANAGED_DYNAMIC_RANGE]
-    output = output_hdr_details if isinstance(output_hdr_details, dict) else {}
-    base_range = info.get("base_layer_range")
-    if (
-        (base_range == "hdr10" and output.get("hdr10") is True)
-        or (base_range == "hlg" and output.get("hlg") is True)
-    ):
-        claims.insert(0, CLIENT_DV8_BASE_LAYER_FALLBACK)
+
+    # The narrower base-layer claim remains specific to a proven DV8 stream
+    # whose compatibility range matches the active display output.
+    if info.get("kodi_base_layer_candidate"):
+        output = output_hdr_details if isinstance(output_hdr_details, dict) else {}
+        base_range = info.get("base_layer_range")
+        if (
+            (base_range == "hdr10" and output.get("hdr10") is True)
+            or (base_range == "hlg" and output.get("hlg") is True)
+        ):
+            claims.insert(0, CLIENT_DV8_BASE_LAYER_FALLBACK)
 
     return claims
