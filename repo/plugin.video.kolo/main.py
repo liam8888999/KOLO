@@ -352,8 +352,7 @@ def _wait_for_natural_playback_end(playback_player, startup_timeout=30.0,
 
     def interrupted():
         return (
-            playback_player.playback_stopped_event.is_set()
-            or playback_player.playback_error_event.is_set()
+            playback_player.playback_error_event.is_set()
             or monitor.abortRequested()
         )
 
@@ -388,6 +387,8 @@ def _wait_for_natural_playback_end(playback_player, startup_timeout=30.0,
 
     # Player.HasMedia/isPlaying can clear before the Python callback is
     # dispatched. Yield to Kodi's event loop for a short, bounded grace period.
+    # Do not return immediately on onPlayBackStopped(): Kodi may dispatch that
+    # teardown notification just before its natural-end callback.
     callback_deadline = time.time() + max(0.0, float(callback_timeout))
     while (
         not natural_end()
