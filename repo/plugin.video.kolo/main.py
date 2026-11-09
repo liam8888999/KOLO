@@ -290,11 +290,12 @@ def episode_display_label(title, episode_number):
 
 
 class _KoloPlaybackPlayer(xbmc.Player):
-    """Kodi player callback bridge used for automatic DV8 recovery."""
+    """Kodi player callbacks used for playback recovery and episode continuation."""
 
     def __init__(self):
         xbmc.Player.__init__(self)
         self.playback_error_event = threading.Event()
+        self.playback_ended_event = threading.Event()
         self.av_started_event = threading.Event()
 
     def onAVStarted(self):
@@ -311,6 +312,11 @@ class _KoloPlaybackPlayer(xbmc.Player):
             xbmc.LOGINFO,
         )
 
+    def onPlayBackEnded(self):
+        """Signal that Kodi reached the natural end of the current item."""
+        self.playback_ended_event.set()
+        log("Kodi reached the end of the current media item.", xbmc.LOGDEBUG)
+
     def onPlayBackError(self):
         self.playback_error_event.set()
         log(
@@ -318,6 +324,15 @@ class _KoloPlaybackPlayer(xbmc.Player):
             "Dolby Vision Profile 8 source can be replanned by Silo.",
             xbmc.LOGWARNING,
         )
+
+
+def auto_play_next_episode_enabled():
+    """Return whether an episode should automatically advance to its successor."""
+    return str(ADDON.getSetting("auto_play_next_episode") or "").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+    )
 
 
 def direct_play_only_enabled():
@@ -8167,6 +8182,195 @@ def resolve_playback_library_id(client, content_id, library_id=None):
     )
 
 
+def find_next_episode(client, current_episode, current_content_id, library_id):
+    """Find the next episode in the current series, independent of the launch list.
+
+    The current episode is located by its Silo content ID in the series' season
+    and episode endpoints. This works for Keep Watching, Home, Search, History,
+    and normal season browsing because none of those directory contexts is used
+    to infer the successor.
+    """
+    if not isinstance(current_episode, dict):
+        return None
+
+    parent = current_episode.get("series")
+    series_id = (
+        current_episode.get("series_id")
+        or current_episode.get("parent_series_id")
+        or (parent.get("id") if isinstance(parent, dict) else None)
+    )
+    if series_id in (None, ""):
+        log(
+            "Cannot find a following episode for %s: parent series ID is missing."
+            % current_content_id,
+            xbmc.LOGDEBUG,
+        )
+        return None
+
+    def number(value):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    seasons = client.seasons(series_id, library_id) or []
+    ordered_seasons = []
+    for index, season in enumerate(seasons):
+        if not isinstance(season, dict):
+            continue
+        season_number = number(
+            season.get("season_number", season.get("number"))
+        )
+        if season_number is None:
+            continue
+        ordered_seasons.append((season_number, index))
+
+    ordered_seasons.sort(key=lambda value: (value[0], value[1]))
+
+    ordered_episodes = []
+    for season_number, _season_index in ordered_seasons:
+        season_episodes = client.episodes(
+            series_id,
+            season_number,
+            library_id,
+        ) or []
+
+        indexed_episodes = []
+        for index, episode in enumerate(season_episodes):
+            if not isinstance(episode, dict):
+                continue
+
+            episode_id = get_content_id(episode)
+            if episode_id in (None, ""):
+                continue
+
+            episode = dict(episode)
+            if episode.get("season_number") is None:
+                episode["season_number"] = season_number
+
+            episode_number = number(
+                episode.get("episode_number", episode.get("number"))
+            )
+            # Prefer explicit episode numbering; retain the endpoint's order
+            # for any items that do not expose a numeric episode number.
+            if episode_number is None:
+                sort_key = (1, index, index)
+            else:
+                sort_key = (0, episode_number, index)
+
+            indexed_episodes.append((sort_key, episode))
+
+        indexed_episodes.sort(key=lambda value: value[0])
+        ordered_episodes.extend(
+            episode for _sort_key, episode in indexed_episodes
+        )
+
+    if not ordered_episodes:
+        return None
+
+    current_id = str(current_content_id or "")
+    current_index = -1
+    for index, episode in enumerate(ordered_episodes):
+        if str(get_content_id(episode) or "") == current_id:
+            current_index = index
+            break
+
+    # Fall back to season/episode numbers if the card does not expose the same ID.
+    if current_index < 0:
+        current_season = number(current_episode.get("season_number"))
+        current_number = number(
+            current_episode.get("episode_number", current_episode.get("number"))
+        )
+        if current_season is not None and current_number is not None:
+            for index, episode in enumerate(ordered_episodes):
+                season_number = number(episode.get("season_number"))
+                episode_number = number(
+                    episode.get("episode_number", episode.get("number"))
+                )
+                if (
+                    season_number == current_season
+                    and episode_number == current_number
+                ):
+                    current_index = index
+                    break
+
+    if current_index < 0:
+        log(
+            "Current episode %s was not found in the episode list for series %s."
+            % (current_content_id, series_id),
+            xbmc.LOGWARNING,
+        )
+        return None
+
+    next_index = current_index + 1
+    if next_index >= len(ordered_episodes):
+        log(
+            "Episode %s is the final available episode in series %s."
+            % (current_content_id, series_id),
+            xbmc.LOGDEBUG,
+        )
+        return None
+
+    return ordered_episodes[next_index]
+
+
+def _auto_play_next_episode(client, current_episode, current_content_id, library_id):
+    """Queue the next episode after a natural playback end."""
+    try:
+        next_episode = find_next_episode(
+            client,
+            current_episode,
+            current_content_id,
+            library_id,
+        )
+    except Exception as exc:
+        log(
+            "Unable to resolve the next episode after %s: %s"
+            % (current_content_id, exc),
+            xbmc.LOGWARNING,
+        )
+        return
+
+    if not next_episode:
+        log(
+            "No following episode is available for %s." % current_content_id,
+            xbmc.LOGDEBUG,
+        )
+        return
+
+    next_content_id = get_content_id(next_episode)
+    if next_content_id in (None, ""):
+        log("The next episode response did not include a content ID.", xbmc.LOGWARNING)
+        return
+
+    params = {
+        "action": "play",
+        "content_id": next_content_id,
+        "library_id": library_id,
+    }
+
+    files = next_episode.get("files") or []
+    if len(files) == 1:
+        file_id = files[0].get("id") or files[0].get("file_id")
+        if file_id:
+            params["file_id"] = file_id
+
+    duration = next_episode.get("duration_seconds")
+    if duration in (None, ""):
+        duration = get_runtime_seconds(next_episode)
+    if duration:
+        params["duration_seconds"] = duration
+
+    next_url = build_url(**params)
+    next_title = next_episode.get("title") or next_episode.get("name") or str(next_content_id)
+    log(
+        "Automatically starting next episode: %s (%s)."
+        % (next_title, next_content_id),
+        xbmc.LOGINFO,
+    )
+    xbmc.executebuiltin('PlayMedia("%s")' % next_url)
+
+
 def _version_codec_label(value):
     """Return a readable codec name for the version picker."""
     codec = str(value or "").strip()
@@ -8952,7 +9156,22 @@ def play(
             xbmc.LOGWARNING,
         )
 
-
+    if (
+        auto_play_next_episode_enabled()
+        and playback_player.playback_ended_event.is_set()
+        and isinstance(detail, dict)
+        and (
+            detail.get("series_id")
+            or detail.get("parent_series_id")
+            or isinstance(detail.get("series"), dict)
+        )
+    ):
+        _auto_play_next_episode(
+            client,
+            detail,
+            content_id,
+            library_id,
+        )
 
 def playback_session_was_terminated(exc):
     """Return True only for Silo's exact progress-session-not-found response.
