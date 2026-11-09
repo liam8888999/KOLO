@@ -18,8 +18,8 @@
     <platform>all</platform>
     <license>GPL-3.0-or-later</license>
     <news>V1.1.26
-* Extend automatic decoder/startup failure recovery to original Dolby Vision streams across profiles
-* Keep client-side base-layer playback restricted to provenance-proven single-layer Profile 8 Main 10 HEVC with a supported compatibility ID
+* Attempt original Dolby Vision playback in Kodi first for every detected profile, then automatically request a Silo fallback after decoder/startup failure
+* Keep the narrower Profile 8 base-layer claim restricted to provenance-proven single-layer Main 10 HEVC with a supported compatibility ID
 * Identify Dolby Vision source profile, codec, bit depth, base-layer provenance and enhancement-layer metadata in playback diagnostics
 * Replan rejected original streams through Silo's profile-aware conversion/transcode planner while preserving playback position
 
