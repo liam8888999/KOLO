@@ -2610,16 +2610,16 @@ class SiloClient:
             dict(delivery_template),
         )
         original_delivery.update(delivery_template)
-        # Only a file-specific, proven single-layer DV Profile 8 Main 10
-        # source can opt into Kodi-managed dynamic-range handling. The user
-        # does not have to guess whether their current platform can decode it:
-        # Kodi's own player will attempt the original stream and report failure.
+        # Any positively identified Dolby Vision profile may be attempted by
+        # Kodi's native player. The managed-dynamic-range claim is profile-
+        # agnostic; the narrower DV8 base-layer claim remains provenance-gated.
+        # If Kodi rejects the original, KOLO asks Silo for an adapted plan.
         original_delivery["validated_claims"] = kodi_original_http_validated_claims(
             video, output_hdr_details, kodi_source_version
         )
         log(
             "Original playback capabilities: HEVC=%s HDR10/HLG=%s "
-            "DV8 base-layer fallback=%s Kodi-managed DV8=%s"
+            "DV8 base-layer fallback=%s Kodi-managed dynamic range=%s"
             % (
                 "hevc" in video,
                 bool(output_hdr_details and (
