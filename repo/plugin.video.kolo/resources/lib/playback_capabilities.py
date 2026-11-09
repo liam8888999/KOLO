@@ -110,10 +110,11 @@ def dolby_vision_source_info(source_version, video_codecs=None):
     if profile is None and not dv_marker:
         return None
 
+    # Never infer a source codec from the client's supported-codec list:
+    # that list is a set of broad compatibility declarations, not source
+    # metadata, and an arbitrary fallback could misclassify AVC/AV1 as HEVC.
     codec = _normalise_codec(
-        track.get("codec")
-        or source_version.get("codec_video")
-        or next(iter(video_codecs or []), "")
+        track.get("codec") or source_version.get("codec_video")
     )
     bit_depth = _as_int(track.get("bit_depth"))
     compat_id = _as_int(track.get("dv_bl_compat_id"))
