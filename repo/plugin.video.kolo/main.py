@@ -8347,7 +8347,6 @@ def _auto_play_next_episode(client, current_episode, current_content_id, library
         "action": "play",
         "content_id": next_content_id,
         "library_id": library_id,
-        "auto_next": 1,
     }
 
     files = next_episode.get("files") or []
@@ -8710,23 +8709,12 @@ def _version_picker_listitem(version, index, poster_url=None):
     return item
 
 
-def choose_file(client, content_id, library_id, auto_select_first=False):
+def choose_file(client, content_id, library_id):
     """Return the file/version selected by the user."""
     versions = client.versions(content_id, library_id)
 
     if not versions:
         raise SiloError("Silo returned no playable versions.")
-
-    if auto_select_first:
-        for version in versions:
-            version_id = version.get("id") or version.get("file_id")
-            if version_id not in (None, ""):
-                log(
-                    "Automatically selected the first available version for episode %s." % content_id,
-                    xbmc.LOGDEBUG,
-                )
-                return version_id
-        raise SiloError("Silo returned no selectable version for the next episode.")
 
     if len(versions) == 1:
         return versions[0].get("id") or versions[0].get("file_id")
@@ -8836,7 +8824,6 @@ def play(
     duration_seconds=None,
     resume=False,
     resume_available=False,
-    auto_next=False,
 ):
     """Play media using Kodi's native Resume/Start-over choice.
 
@@ -8866,12 +8853,7 @@ def play(
     )
 
     if not file_id:
-        file_id = choose_file(
-            client,
-            content_id,
-            library_id,
-            auto_select_first=auto_next,
-        )
+        file_id = choose_file(client, content_id, library_id)
 
     if not file_id:
         return
@@ -11077,8 +11059,6 @@ def router(client):
             params.get("duration_seconds"),
             resume=kodi_requested_resume(),
             resume_available=str(params.get("resume_available", "")).strip().lower()
-            in ("1", "true", "yes"),
-            auto_next=str(params.get("auto_next", "")).strip().lower()
             in ("1", "true", "yes"),
         )
         return
