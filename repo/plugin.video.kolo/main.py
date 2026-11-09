@@ -290,7 +290,7 @@ def episode_display_label(title, episode_number):
 
 
 class _KoloPlaybackPlayer(xbmc.Player):
-    """Kodi player callback bridge used for automatic DV8 recovery."""
+    """Kodi player callbacks used for playback recovery and episode continuation."""
 
     def __init__(self):
         xbmc.Player.__init__(self)
@@ -9174,7 +9174,7 @@ def play(
             xbmc.LOGWARNING,
         )
 
-if (
+    if (
         auto_play_next_episode_enabled()
         and playback_player.playback_ended_event.is_set()
         and isinstance(detail, dict)
