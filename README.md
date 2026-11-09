@@ -60,6 +60,11 @@ https://liam8888999.github.io/KOLO/
 
 ## 📝 Changelog
 
+*** V1.1.25 ***
+* Add an optional setting to automatically play the next episode when the current episode finishes naturally
+* Resolve the next episode using the show's season and episode listings, so it works when playback starts from Keep Watching, Home, Search, History or season browsing
+* Keep the normal KOLO version-selection flow for the next episode
+
 The release history below records the features and fixes introduced in the versions for which notes are available. Some older releases are omitted because no notes were supplied for them.
 
 *** V1.1.21 ***
