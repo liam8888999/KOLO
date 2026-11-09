@@ -52,7 +52,7 @@ import xbmcvfs
 import xbmcaddon
 
 from resources.lib.skipping import SkipTracker, segments as skip_segments
-from resources.lib.playback_capabilities import is_kodi_managed_dv8_source
+from resources.lib.playback_capabilities import dolby_vision_source_info
 from resources.lib.silo import (
     SiloClient,
     SiloError,
@@ -321,7 +321,7 @@ class _KoloPlaybackPlayer(xbmc.Player):
         self.playback_error_event.set()
         log(
             "Kodi reported a playback error; checking whether the active "
-            "Dolby Vision Profile 8 source can be replanned by Silo.",
+            "Dolby Vision source can be replanned by Silo.",
             xbmc.LOGWARNING,
         )
 
@@ -8898,11 +8898,25 @@ def play(
     # Silo position, while Start from beginning receives no resume point.
     direct_play_only = direct_play_only_enabled()
     source_version = _detail_version(detail, file_id) if isinstance(detail, dict) else None
-    kodi_dv8_source = is_kodi_managed_dv8_source(source_version, ["hevc"])
-    if kodi_dv8_source:
+    dv_info = dolby_vision_source_info(source_version, ["hevc"])
+    if dv_info:
         log(
-            "Kodi auto-play negotiation: proven single-layer Dolby Vision "
-            "Profile 8 Main 10 source; allowing Kodi to attempt original playback.",
+            "Kodi Dolby Vision negotiation: profile=%s (%s) codec=%s "
+            "bit_depth=%s base_layer=%s compat_id=%s enhancement_layer=%s "
+            "route_hint=%s. Kodi profile support is not inferred from the "
+            "display HDR label; Silo remains responsible for profile-specific "
+            "conversion and fallback planning."
+            % (
+                dv_info.get("profile"),
+                dv_info.get("profile_description"),
+                dv_info.get("codec") or "unknown",
+                dv_info.get("bit_depth") or "unknown",
+                "proven" if dv_info.get("base_layer_proven") else "unproven",
+                dv_info.get("base_layer_compatibility_id")
+                if dv_info.get("base_layer_compatibility_id") is not None else "unknown",
+                dv_info.get("enhancement_layer") or "unknown",
+                dv_info.get("strategy"),
+            ),
             xbmc.LOGINFO,
         )
 
@@ -9227,26 +9241,25 @@ def _kolo_playback_url_key(value):
     return parsed._replace(query="", fragment="").geturl().rstrip("/")
 
 
-def _kolo_is_managed_dv8_original_plan(playback_info):
-    """True only while the active server plan is an original proven DV8 stream."""
+def _kolo_is_dolby_vision_original_plan(playback_info):
+    """True when Silo's active plan is delivering an original Dolby Vision source."""
     plan = (playback_info or {}).get("playback_plan") or {}
     source = plan.get("source") or {}
+    dynamic_range = (
+        str(source.get("dynamic_range") or "").strip().lower()
+        .replace("-", "_").replace(" ", "_")
+    )
     return (
         str(plan.get("delivery") or "").strip().lower() == "original_http"
-        and str(source.get("dynamic_range") or "").strip().lower() == "dolby_vision"
-        and int(source.get("dolby_vision_profile") or 0) == 8
-        and source.get("dv_base_layer_proven") is True
-        and str(source.get("dv_enhancement_layer") or "").strip().lower() == "none"
-        and str(source.get("video_codec") or "").strip().lower() == "hevc"
-        and int(source.get("bit_depth") or 0) == 10
+        and dynamic_range in ("dolby_vision", "dolbyvision", "dovi")
     )
 
 
-def _kolo_replan_after_dv8_failure(
+def _kolo_replan_after_dolby_vision_failure(
     client, player, playback_info, resolved_item, position, failure_classification
 ):
-    """Ask Silo for an adapted plan after Kodi rejects the original DV8 stream."""
-    if not _kolo_is_managed_dv8_original_plan(playback_info):
+    """Ask Silo for a profile-aware adapted plan after Kodi rejects a DV original."""
+    if not _kolo_is_dolby_vision_original_plan(playback_info):
         return False
 
     old_url = str((playback_info or {}).get("url") or "")
@@ -9268,7 +9281,7 @@ def _kolo_replan_after_dv8_failure(
         "classification": str(failure_classification or "decoder_failure")[:64],
         "message": (
             "Kodi's native player could not start or continue the original "
-            "Dolby Vision Profile 8 stream; requesting an adapted Silo plan."
+            "Dolby Vision stream; requesting a profile-aware adapted Silo plan."
         ),
     }
     try:
@@ -9281,7 +9294,7 @@ def _kolo_replan_after_dv8_failure(
         )
     except Exception as exc:
         log(
-            "Silo could not replan the failed Dolby Vision Profile 8 stream: %s" % exc,
+            "Silo could not replan the failed Dolby Vision stream: %s" % exc,
             xbmc.LOGWARNING,
         )
         return False
@@ -9291,7 +9304,7 @@ def _kolo_replan_after_dv8_failure(
     if not new_url or str(new_plan.get("delivery") or "").lower() == "original_http":
         log(
             "Silo did not produce an adapted route after Kodi rejected the "
-            "Dolby Vision Profile 8 source (delivery=%s)."
+            "Dolby Vision source (delivery=%s)."
             % (new_plan.get("delivery") or "unknown"),
             xbmc.LOGWARNING,
         )
@@ -9356,7 +9369,7 @@ def _kolo_replan_after_dv8_failure(
         if isinstance(item, dict)
     ]
     log(
-        "Kodi rejected the original DV8 stream; Silo fallback started: "
+        "Kodi rejected the original Dolby Vision stream; Silo fallback started: "
         "delivery=%s transformations=%s"
         % (
             new_plan.get("delivery") or "unknown",
@@ -9417,12 +9430,12 @@ def track_progress(
 
     if (
         not player.isPlaying()
-        and _kolo_is_managed_dv8_original_plan(playback_info)
+        and _kolo_is_dolby_vision_original_plan(playback_info)
         and not direct_play_only
     ):
         if startup_failure is None:
             startup_failure = "startup_timeout"
-        recovered = _kolo_replan_after_dv8_failure(
+        recovered = _kolo_replan_after_dolby_vision_failure(
             client,
             player,
             playback_info,
@@ -9434,7 +9447,7 @@ def track_progress(
             session_id = str(playback_info.get("session_id") or session_id)
         else:
             log(
-                "Kodi could not open the original Dolby Vision Profile 8 stream "
+                "Kodi could not open the original Dolby Vision stream "
                 "and Silo did not provide a playable fallback.",
                 xbmc.LOGWARNING,
             )
@@ -9917,14 +9930,14 @@ def track_progress(
         if (
             getattr(player, "playback_error_event", None)
             and player.playback_error_event.is_set()
-            and _kolo_is_managed_dv8_original_plan(playback_info)
+            and _kolo_is_dolby_vision_original_plan(playback_info)
             and not direct_play_only
         ):
             try:
                 error_position = max(0.0, float(player.getTime() or last_position))
             except Exception:
                 error_position = max(0.0, float(last_position or 0.0))
-            recovered = _kolo_replan_after_dv8_failure(
+            recovered = _kolo_replan_after_dolby_vision_failure(
                 client,
                 player,
                 playback_info,
@@ -9951,7 +9964,7 @@ def track_progress(
             )
             break
         elif getattr(player, "playback_error_event", None):
-            # A non-DV8 playback error is not eligible for this narrow fallback.
+            # A non-Dolby-Vision playback error is not eligible for this narrow fallback.
             player.playback_error_event.clear()
 
         if skip_tracker is not None and not _watch_party_connection_active():
