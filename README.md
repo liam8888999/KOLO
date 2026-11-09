@@ -45,7 +45,9 @@ https://liam8888999.github.io/KOLO/
 * Log Silo's playback decision reason, source/output dynamic range, selected transformations and degradation codes to make unexpected transcoding diagnosable.
 * Use the latest server-side resume position with Kodi's native Resume / Start from beginning prompt.
 * Report playback capabilities to Silo Server, including supported video/audio and display HDR details where Kodi exposes them, to help the server plan playback.
-* Automatically try Kodi's native player on proven, single-layer Dolby Vision Profile 8 Main 10 files, across supported platforms; if Kodi reports a decoder/startup playback error, replan through Silo's available remux/transcode routes. Other Dolby Vision profiles remain on Silo's normal capability-planned path.
+* Identify Dolby Vision source profiles and metadata across legacy, streaming and disc-oriented formats; do not infer Kodi profile support from a display HDR label.
+* Attempt the narrow Profile 8 Main 10 base-layer route only when Silo proves the single-layer HEVC source, compatibility ID and base-layer metadata. Profile 7 is left to Silo's dedicated conversion paths; Profile 5 and other profiles are not incorrectly treated as HDR10 base-layer sources.
+* When Kodi rejects an original Dolby Vision stream with a decoder/startup failure, automatically request a profile-aware alternative from Silo, preserving the current playback position and respecting **Only allow direct play**.
 * Negotiate server-supported HLS subtitle renditions so compatible embedded text tracks can be offered by Kodi's native player.
 * Skip available intro, recap and credits segments. You can choose prompts or enable automatic skipping separately for intros, recaps and credits in the add-on settings.
 * Support server-side playback termination, which stops the active Kodi stream when Silo Server revokes or terminates its session.
@@ -59,6 +61,11 @@ https://liam8888999.github.io/KOLO/
 * Join an existing Silo Watch Party and synchronise playback with the room.
 
 ## 📝 Changelog
+
+*** V1.1.26 ***
+* Extend automatic decoder/startup failure recovery to original Dolby Vision streams across profiles
+* Keep client-side base-layer playback restricted to proven single-layer Profile 8 Main 10 HEVC with a supported compatibility ID
+* Add detailed source-profile and fallback diagnostics; let Silo choose profile-specific conversion/transcode routes
 
 *** V1.1.25 ***
 * Add an optional setting to automatically play the next episode when the current episode finishes naturally
