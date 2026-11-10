@@ -8344,6 +8344,7 @@ def find_next_episode(client, current_episode, current_content_id, library_id):
     # every earlier season. If it is absent, retain the complete-search fallback.
     start_index = current_season_index if current_season_index is not None else 0
     current_found = False
+    episodes_by_season = {}
 
     for season_index in range(start_index, len(ordered_seasons)):
         season_number = ordered_seasons[season_index][0]
@@ -8351,6 +8352,7 @@ def find_next_episode(client, current_episode, current_content_id, library_id):
             client.episodes(series_id, season_number, library_id),
             season_number,
         )
+        episodes_by_season[season_number] = episodes
 
         if not episodes:
             continue
@@ -8382,11 +8384,46 @@ def find_next_episode(client, current_episode, current_content_id, library_id):
                 continue
 
             if current_season_index is not None:
+                # Metadata can occasionally report a season number that differs
+                # from the season endpoint. Preserve the old full-series lookup
+                # as a correctness fallback, reusing the season already fetched.
                 log(
-                    "Current episode %s was not found in season %s of series %s."
-                    % (current_content_id, season_number, series_id),
-                    xbmc.LOGWARNING,
+                    "Current episode %s was not found in its reported season %s; "
+                    "falling back to a full series scan."
+                    % (current_content_id, season_number),
+                    xbmc.LOGDEBUG,
                 )
+                ordered_episodes = []
+                for fallback_number, _original_index in ordered_seasons:
+                    fallback_episodes = episodes_by_season.get(fallback_number)
+                    if fallback_episodes is None:
+                        fallback_episodes = _ordered_season_episodes(
+                            client.episodes(series_id, fallback_number, library_id),
+                            fallback_number,
+                        )
+                        episodes_by_season[fallback_number] = fallback_episodes
+                    ordered_episodes.extend(fallback_episodes)
+
+                fallback_index = next(
+                    (
+                        index for index, episode in enumerate(ordered_episodes)
+                        if str(get_content_id(episode) or "") == current_id
+                    ),
+                    -1,
+                )
+                if fallback_index < 0 and current_number is not None:
+                    fallback_index = next(
+                        (
+                            index for index, episode in enumerate(ordered_episodes)
+                            if _episode_number(episode.get("season_number")) == current_season
+                            and _episode_number(
+                                episode.get("episode_number", episode.get("number"))
+                            ) == current_number
+                        ),
+                        -1,
+                    )
+                if fallback_index >= 0 and fallback_index + 1 < len(ordered_episodes):
+                    return ordered_episodes[fallback_index + 1]
                 return None
             continue
 
