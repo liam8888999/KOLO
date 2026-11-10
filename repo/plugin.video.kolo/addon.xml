@@ -23,10 +23,6 @@
 * Distinguish natural completion from manual stops and playback errors before launching the next episode
 
 V1.1.26
-* Fix autoplay next episode occasionally failing to start after natural playback completion
-* Keep the Kodi playback callback alive while waiting for the end event, including playback started without a Silo session
-* Distinguish natural completion from manual stops and playback errors before launching the next episode
-
 * Attempt original Dolby Vision playback in Kodi first for every detected profile, then automatically request a Silo fallback after decoder/startup failure
 * Keep the narrower Profile 8 base-layer claim restricted to provenance-proven single-layer Main 10 HEVC with a supported compatibility ID
 * Identify Dolby Vision source profile, codec, bit depth, base-layer provenance and enhancement-layer metadata in playback diagnostics
