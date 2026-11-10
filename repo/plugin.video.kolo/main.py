@@ -296,6 +296,7 @@ class _KoloPlaybackPlayer(xbmc.Player):
         xbmc.Player.__init__(self)
         self.playback_error_event = threading.Event()
         self.playback_ended_event = threading.Event()
+        self.playback_stopped_event = threading.Event()
         self.av_started_event = threading.Event()
 
     def onAVStarted(self):
@@ -317,6 +318,11 @@ class _KoloPlaybackPlayer(xbmc.Player):
         self.playback_ended_event.set()
         log("Kodi reached the end of the current media item.", xbmc.LOGDEBUG)
 
+    def onPlayBackStopped(self):
+        """Signal an explicit stop; this must never trigger episode autoplay."""
+        self.playback_stopped_event.set()
+        log("Kodi playback was stopped before natural completion.", xbmc.LOGDEBUG)
+
     def onPlayBackError(self):
         self.playback_error_event.set()
         log(
@@ -324,6 +330,74 @@ class _KoloPlaybackPlayer(xbmc.Player):
             "Dolby Vision source can be replanned by Silo.",
             xbmc.LOGWARNING,
         )
+
+
+def _wait_for_natural_playback_end(playback_player, startup_timeout=30.0,
+                                   callback_timeout=3.0):
+    """Keep the plugin callback owner alive until Kodi reports how playback ended.
+
+    The playback monitor can observe Player.HasMedia becoming false just
+    before Kodi dispatches onPlayBackEnded(). Waiting briefly for the callback
+    avoids losing natural-end notifications to that teardown race. When no
+    Silo playback session exists, keep this script alive for the whole item so
+    the Kodi player callbacks remain registered.
+
+    An explicit stop, playback error, or Kodi shutdown is never treated as a
+    natural end.
+    """
+    monitor = xbmc.Monitor()
+
+    def natural_end():
+        return playback_player.playback_ended_event.is_set()
+
+    def interrupted():
+        return (
+            playback_player.playback_error_event.is_set()
+            or monitor.abortRequested()
+        )
+
+    if natural_end():
+        return True
+
+    # A session-less playback still needs this script to remain alive while
+    # Kodi starts and plays the item; otherwise the Player callback object can
+    # be discarded before Kodi emits its completion callback.
+    startup_deadline = time.time() + max(0.0, float(startup_timeout))
+    while (
+        not playback_player.isPlaying()
+        and not natural_end()
+        and not interrupted()
+        and time.time() < startup_deadline
+    ):
+        xbmc.sleep(100)
+
+    if playback_player.isPlaying():
+        while (
+            playback_player.isPlaying()
+            and not natural_end()
+            and not interrupted()
+        ):
+            xbmc.sleep(250)
+
+    if natural_end():
+        return True
+
+    if interrupted():
+        return False
+
+    # Player.HasMedia/isPlaying can clear before the Python callback is
+    # dispatched. Yield to Kodi's event loop for a short, bounded grace period.
+    # Do not return immediately on onPlayBackStopped(): Kodi may dispatch that
+    # teardown notification just before its natural-end callback.
+    callback_deadline = time.time() + max(0.0, float(callback_timeout))
+    while (
+        not natural_end()
+        and not interrupted()
+        and time.time() < callback_deadline
+    ):
+        xbmc.sleep(100)
+
+    return natural_end()
 
 
 def auto_play_next_episode_enabled():
@@ -9170,9 +9244,18 @@ def play(
             xbmc.LOGWARNING,
         )
 
+    # track_progress() can return as soon as Kodi clears Player.HasMedia,
+    # before onPlayBackEnded() has been dispatched. In the session-less path
+    # this also keeps the Python callback owner alive for the duration of the
+    # media item.
+    natural_end = _wait_for_natural_playback_end(
+        playback_player,
+        startup_timeout=30.0 if not session_id else 0.0,
+    )
+
     if (
         auto_play_next_episode_enabled()
-        and playback_player.playback_ended_event.is_set()
+        and natural_end
         and isinstance(detail, dict)
         and (
             detail.get("series_id")
