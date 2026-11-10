@@ -8458,8 +8458,12 @@ def _start_next_episode_prefetch(client, current_episode, current_content_id, li
     def resolve():
         started = time.monotonic()
         try:
+            # Keep background catalog reads on their own requests.Session.
+            # The main client is concurrently used by playback-progress updates.
+            prefetch_client = SiloClient()
+            prefetch_client.cfg.update(client.cfg)
             state["episode"] = find_next_episode(
-                client,
+                prefetch_client,
                 current_episode,
                 current_content_id,
                 library_id,
