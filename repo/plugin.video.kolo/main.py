@@ -3089,7 +3089,14 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
             or (detail or {}).get("poster")
             or (detail or {}).get("image")
         ),
-        backdrop=catalog_item.get("backdrop_url") or catalog_item.get("backdrop") or (detail or {}).get("backdrop_url") or (detail or {}).get("backdrop"),
+        backdrop=(
+            catalog_item.get("backdrop_url")
+            or catalog_item.get("backdrop")
+            or ((catalog_item.get("backdrop_urls") or [None])[0])
+            or (detail or {}).get("backdrop_url")
+            or (detail or {}).get("backdrop")
+            or (((detail or {}).get("backdrop_urls") or [None])[0])
+        ),
         logo=catalog_item.get("logo_url") or catalog_item.get("logo") or (detail or {}).get("logo_url") or (detail or {}).get("logo"),
         still=catalog_item.get("still_url") or catalog_item.get("still") or (detail or {}).get("still_url") or (detail or {}).get("still"),
         banner=catalog_item.get("banner_url") or catalog_item.get("banner") or (detail or {}).get("banner_url") or (detail or {}).get("banner"),
@@ -3145,6 +3152,14 @@ def list_search_results(client, query, page=1, cursor=None, window_cursor=None):
     people_client.cfg.update(client.cfg)
     box_sets_client = SiloClient()
     box_sets_client.cfg.update(client.cfg)
+    # Resolve capabilities before launching concurrent searches so the shared
+    # client never races two capability requests through one requests.Session.
+    search_capabilities = client.catalog_search_capabilities()
+    people_scope = (
+        "video_with_episodes"
+        if search_capabilities.get("video_with_episodes_scope") is True
+        else "video"
+    )
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         media_future = executor.submit(
@@ -3154,12 +3169,6 @@ def list_search_results(client, query, page=1, cursor=None, window_cursor=None):
             offset=offset,
             cursor=cursor,
             window_cursor=window_cursor,
-        )
-        search_capabilities = client.catalog_search_capabilities()
-        people_scope = (
-            "video_with_episodes"
-            if search_capabilities.get("video_with_episodes_scope") is True
-            else "video"
         )
         people_future = executor.submit(
             people_client.search_people,
@@ -9790,10 +9799,6 @@ def track_progress(
         fixed_rungs = [entry for entry in ladder if entry["label"] != "auto"]
 
         preferred = str(info.get("adaptive_quality") or "").strip()
-        if preferred and preferred.lower() not in ("auto", "original"):
-            if any(entry["label"] == preferred for entry in fixed_rungs):
-                return preferred
-
         requested = str(
             info.get("quality_preference")
             or plan.get("quality_preference")
@@ -9801,6 +9806,18 @@ def track_progress(
         ).strip().lower()
         if requested == "original":
             requested = "auto"
+
+        active_quality = str(plan.get("active_quality") or "").strip()
+        if (
+            active_quality
+            and requested != "auto"
+            and any(entry["label"] == active_quality for entry in fixed_rungs)
+        ):
+            return active_quality
+
+        if preferred and preferred.lower() not in ("auto", "original"):
+            if any(entry["label"] == preferred for entry in fixed_rungs):
+                return preferred
 
         delivery = str(plan.get("delivery") or "").strip().lower()
         reason = str(plan.get("decision_reason") or "").strip().lower()
