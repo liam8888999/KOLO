@@ -63,6 +63,16 @@ https://liam8888999.github.io/KOLO/
 
 ## 📝 Changelog
 
+*** V1.1.28 ***
+* Resolve the next episode in the background while the current episode is playing, reducing the delay at natural completion
+* Fetch only the current and subsequent seasons when locating the next episode, avoiding unnecessary full-series API requests
+* Isolate background episode lookups from playback-progress network activity, while retaining a full-series fallback when season metadata does not match
+
+*** V1.1.27 ***
+* Fix autoplay next episode occasionally failing to start after natural playback completion
+* Keep the Kodi playback callback alive while waiting for the end event, including playback started without a Silo session
+* Distinguish natural completion from manual stops and playback errors before launching the next episode
+
 *** V1.1.26 ***
 * Attempt original Dolby Vision playback in Kodi first for every detected profile, then automatically request a Silo fallback after decoder/startup failure
 * Keep client-side base-layer playback restricted to proven single-layer Profile 8 Main 10 HEVC with a supported compatibility ID
