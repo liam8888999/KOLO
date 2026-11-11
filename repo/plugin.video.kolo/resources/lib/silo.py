@@ -531,6 +531,17 @@ class SiloClient:
     # send_profile=False leaves out X-Profile-Id/X-Profile-Token, which the
     # PIN check must not send: the server refuses a request naming a locked
     # profile without its token, so that request would never reach the check.
+    def _device_identity_headers(self):
+        """Return the device identity Silo stores on a login session."""
+        device_id = _setting("device_id") or self.cfg.get("device_id") or ""
+        friendly_name = str(xbmc.getInfoLabel("System.FriendlyName") or "").strip()
+        device_name = "Kodi on %s" % friendly_name if friendly_name else "Kodi"
+        return {
+            "X-Silo-Device-Id": device_id,
+            "X-Silo-Device-Name": device_name,
+            "X-Silo-Device-Platform": "Kodi",
+        }
+
     def _headers(self, send_profile=True):
         # Kodi's settings store is authoritative. Read the live values
         # directly instead of relying on a potentially stale in-memory cfg.
@@ -548,11 +559,11 @@ class SiloClient:
         h = {
             "Accept": "application/json",
             "X-Device-ID": device_id,
-            "X-Silo-Device-Id": device_id,
             "X-Client-Name": "plugin.video.kolo",
             "X-Client-Version": ADDON_VERSION,
             "X-Client-Platform": "kodi",
         }
+        h.update(self._device_identity_headers())
 
         if token:
             h["Authorization"] = "Bearer " + token
@@ -893,13 +904,7 @@ class SiloClient:
             r = self.session.post(
                 self.base + "/api/v2/auth/login",
                 timeout=20,
-                headers={
-                    "Accept": "application/json",
-                    "X-Device-ID": self.cfg["device_id"],
-                    "X-Client-Name": "plugin.video.kolo",
-                    "X-Client-Version": ADDON_VERSION,
-                    "X-Client-Platform": "kodi",
-                },
+                headers=self._client_headers(),
                 json={
                     "username": self.cfg["username"],
                     "password": pw,
@@ -927,13 +932,15 @@ class SiloClient:
 
     # Headers for requests made before the addon has a session.
     def _client_headers(self):
-        return {
+        headers = {
             "Accept": "application/json",
             "X-Device-ID": _setting("device_id") or self.cfg["device_id"],
             "X-Client-Name": "plugin.video.kolo",
             "X-Client-Version": ADDON_VERSION,
             "X-Client-Platform": "kodi",
         }
+        headers.update(self._device_identity_headers())
+        return headers
 
     # Fetch an unauthenticated JSON document, or None when the server does
     # not answer it (an older server without the endpoint, or a network error).
@@ -1341,13 +1348,7 @@ class SiloClient:
                 try:
                     r = self.session.post(
                         self.base + "/api/v2/auth/refresh",
-                        headers={
-                            "Accept": "application/json",
-                            "X-Device-ID": _setting("device_id") or self.cfg["device_id"],
-                            "X-Client-Name": "plugin.video.kolo",
-                            "X-Client-Version": ADDON_VERSION,
-                            "X-Client-Platform": "kodi",
-                        },
+                        headers=self._client_headers(),
                         json={"refresh_token": rt},
                         timeout=20,
                     )
