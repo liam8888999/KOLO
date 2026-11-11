@@ -548,6 +548,7 @@ class SiloClient:
         h = {
             "Accept": "application/json",
             "X-Device-ID": device_id,
+            "X-Silo-Device-Id": device_id,
             "X-Client-Name": "plugin.video.kolo",
             "X-Client-Version": ADDON_VERSION,
             "X-Client-Platform": "kodi",
@@ -1860,7 +1861,7 @@ class SiloClient:
     # Search the profile-visible catalog across all accessible libraries.
     # Silo performs the search server-side, so the addon does not need to
     # download and scan every library itself.
-    def search_people(self, query, limit=20):
+    def search_people(self, query, limit=20, media_scope=None):
         """Search profile-visible Silo people by name."""
         query = str(query or "").strip()
         if not query:
@@ -1871,13 +1872,22 @@ class SiloClient:
         except (TypeError, ValueError):
             limit = 20
 
+        capabilities = self.catalog_search_capabilities()
+        if media_scope is None:
+            media_scope = (
+                "video_with_episodes"
+                if capabilities.get("video_with_episodes_scope") is True
+                else "video"
+            )
+        params = {
+            "q": query,
+            "limit": limit,
+            "media_scope": media_scope,
+        }
         data = self._json(
             "GET",
             "/api/v2/catalog/people",
-            params={
-                "q": query,
-                "limit": limit,
-            },
+            params=params,
         ) or {}
 
         return data.get("items", [])
@@ -1912,7 +1922,7 @@ class SiloClient:
             self._next(data),
         )
 
-    def search_catalog(self, query, limit=100, offset=0):
+    def search_catalog(self, query, limit=100, offset=0, cursor=None, window_cursor=None):
         """Return one page of Silo's v2 server-side catalog search results.
 
         Keep the add-on's existing page/offset interface, but translate the
@@ -1934,18 +1944,29 @@ class SiloClient:
         except (TypeError, ValueError):
             offset = 0
 
+        capabilities = self.catalog_search_capabilities()
+        media_scope = (
+            "video_with_episodes"
+            if capabilities.get("video_with_episodes_scope") is True
+            else "video"
+        )
         params = {
             "source": "query",
             "q": query,
+            "type": media_scope,
             "limit": limit,
             "skip_total": "true",
             "image_size": "medium",
         }
 
-        # Silo v2 uses seek for a direct jump to the requested zero-based
-        # result window. Page 1 naturally starts at position zero, so omit it.
-        if offset:
+        # Adjacent pages must follow the opaque continuation cursor. Use the
+        # window cursor with seek only for a direct jump (including Previous).
+        if cursor:
+            params["cursor"] = cursor
+        elif offset:
             params["seek"] = offset
+            if window_cursor:
+                params["window_cursor"] = window_cursor
 
         data = self._json(
             "GET",
@@ -1961,7 +1982,7 @@ class SiloClient:
             "total": data.get("total", 0),
             "total_exact": bool(data.get("total_exact", False)),
             "next_cursor": page.get("next_cursor"),
-            "window_cursor": data.get("window_cursor"),
+            "window_cursor": data.get("window_cursor") or window_cursor,
         }
 
     # Join an existing Watch Party. Kodi intentionally exposes no
@@ -2236,6 +2257,45 @@ class SiloClient:
         self._details[key] = data
         return data
 
+    # Return the native watch-state document for one playable item. Unlike
+    # /progress this is a targeted read and includes the acting profile's
+    # user_data alongside the exact file versions, markers and trickplay facts.
+    def watch_detail(self, content_id, library_id=None, file_id=None):
+        content_id = str(content_id or "").strip()
+        if not content_id:
+            return {}
+        params = {"image_size": "small"}
+        if library_id:
+            params["library_id"] = library_id
+        if file_id:
+            params["file_id"] = file_id
+        data = self._json(
+            "GET",
+            "/api/v2/watch/%s" % quote(content_id, safe=":"),
+            params=params,
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def progress_from_watch_detail(watch_detail, content_id=None):
+        """Convert getWatchState user_data into KOLO's common progress shape."""
+        if not isinstance(watch_detail, dict):
+            return None
+        user_data = watch_detail.get("user_data")
+        if not isinstance(user_data, dict):
+            return None
+        return {
+            "media_item_id": str(content_id or watch_detail.get("content_id") or ""),
+            "position_seconds": user_data.get("position_seconds", 0),
+            "duration_seconds": user_data.get("duration_seconds", 0),
+            "completed": bool(user_data.get("played")),
+            "played": bool(user_data.get("played")),
+            "is_in_progress": bool(user_data.get("is_in_progress")),
+            "last_file_id": user_data.get("last_file_id"),
+        }
+
     # Return the playable versions/files for one catalog item.
     def versions(self, content_id, library_id=None):
         data = self._json(
@@ -2314,22 +2374,35 @@ class SiloClient:
 
     # Return the newest Silo progress record for one catalog media item.
     def get_progress(self, content_id, library_id=None):
+        """Read one item's authoritative progress without paging all history."""
+        try:
+            detail = self.watch_detail(content_id, library_id=library_id)
+        except SiloError as exc:
+            # Retain compatibility with older v2 deployments that predate
+            # getWatchState. A missing user_data on a successful watch read is
+            # authoritative and must not trigger a history download.
+            if exc.status not in (404, 501):
+                raise
+            log(
+                "Targeted watch-state read is unavailable; falling back to paged progress: %s" % exc,
+                xbmc.LOGDEBUG,
+            )
+            detail = None
+
+        if detail is not None:
+            return self.progress_from_watch_detail(detail, content_id)
+
         matches = [
             record
             for record in self.progress(library_id=library_id)
             if str(record.get("media_item_id")) == str(content_id)
         ]
-
         if not matches:
             return None
-
-        # Silo returns newest-change-first, but sorting explicitly means this
-        # method remains correct even if the API ordering changes later.
         matches.sort(
             key=lambda record: record.get("updated_at") or "",
             reverse=True,
         )
-
         return matches[0]
 
     # Build a single lookup map containing the newest record for each media item.
@@ -2649,7 +2722,20 @@ class SiloClient:
         hls_delivery["video_codecs"] = ["h264"]
         hls_delivery["audio_decode_codecs"] = ["aac"]
         hls_delivery["audio_passthrough_codecs"] = []
+        hls_features = list(hls_delivery.get("features") or [])
+        for feature in ("hls_copy_mpegts_v1", "hls_variable_substitution_v1"):
+            if feature in supported_features and feature not in hls_features:
+                hls_features.append(feature)
+        hls_delivery["features"] = hls_features
         deliveries["hls"] = hls_delivery
+
+        progressive_features = list(progressive_delivery.get("features") or [])
+        if (
+            "progressive_range_refusal_v1" in supported_features
+            and "progressive_range_refusal_v1" not in progressive_features
+        ):
+            progressive_features.append("progressive_range_refusal_v1")
+        progressive_delivery["features"] = progressive_features
 
         # These declarations are about what the active output can display,
         # not what the server can encode. Replace any generic/server-default
@@ -2676,6 +2762,14 @@ class SiloClient:
 
         supported_features = set(caps.get("features") or [])
         client_features = ["playback_plan_v3", "seek_reanchor_v1"]
+        # The Kodi skip tracker consumes every marker occurrence, rather than
+        # collapsing repeated intros/credits into one broad range.
+        if "marker_segments_v1" in supported_features:
+            client_features.append("marker_segments_v1")
+        # Enable server-side learned buffering limits only on servers that
+        # explicitly advertise the v2 feature.
+        if "buffering_quality_v1" in supported_features:
+            client_features.append("buffering_quality_v1")
         # Kodi's native player can consume the HLS SUBTITLES group. Add the
         # optional rendition features only when this server advertises them.
         if "hls_subtitle_renditions_v1" in supported_features:
@@ -2734,6 +2828,8 @@ class SiloClient:
             estimate = self.measure_bandwidth_kbps()
             if estimate is not None:
                 body["bandwidth_estimate_kbps"] = estimate
+                if "buffering_quality_v1" in client_features:
+                    body["bandwidth_estimate_source"] = "probe"
 
         return body
 
