@@ -2984,7 +2984,9 @@ def add_catalog_context_menu(list_item, catalog_item):
         str(list_item.getProperty("Kolo.AccessedFromParent") or "").strip().lower()
         in ("true", "1", "yes")
     )
-    if not accessed_from_parent:
+    # Only episodes/seasons expose parent navigation. Library-level parent
+    # actions are intentionally omitted from the context menu.
+    if not accessed_from_parent and media_type in ("episode", "season"):
         library_id = (
             catalog_item.get("library_id")
             or list_item.getProperty("Kolo.LibraryID")
@@ -3005,12 +3007,8 @@ def add_catalog_context_menu(list_item, catalog_item):
         if series_id:
             parent_params["series_id"] = series_id
 
-        if media_type in ("episode", "season"):
-            parent_label = "Open parent show"
-        else:
-            parent_label = "Open parent library"
         menu_items.append((
-            parent_label,
+            "Open parent show",
             "RunPlugin(%s)" % build_url(**parent_params),
         ))
 
