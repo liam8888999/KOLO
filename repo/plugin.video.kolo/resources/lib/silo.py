@@ -3299,14 +3299,20 @@ class SiloClient:
         if not attempt_id:
             return False
         body = {
+            "installation_id": self._installation_id(),
+            "event_id": str(uuid.uuid4()),
             "protocol_version": 3,
             "playback_attempt_id": attempt_id,
-            "session_id": str(info.get("session_id") or ""),
-            "plan_id": str(plan.get("plan_id") or ""),
-            "plan_attempt_id": str(info.get("plan_attempt_id") or ""),
-            "plan_attempt_key": str(plan.get("plan_attempt_key") or ""),
             "event": str(event or ""),
         }
+        for key, value in (
+            ("session_id", info.get("session_id")),
+            ("plan_id", plan.get("plan_id")),
+            ("plan_attempt_id", info.get("plan_attempt_id")),
+            ("plan_attempt_key", plan.get("plan_attempt_key")),
+        ):
+            if value not in (None, ""):
+                body[key] = str(value)
         if diagnostics:
             body["diagnostics"] = {
                 str(key): str(value)
