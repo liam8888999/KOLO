@@ -5810,8 +5810,8 @@ def _start_watch_party_guest_playback(
     player=None,
 ):
     """Start the host-selected item using the normal Kodi playback path."""
-    library_id = resolve_playback_library_id(client, content_id, library_id)
-
+    # Library context is optional; retain it only when the originating
+    # directory supplied it.
     if not file_id:
         file_id = choose_file(client, content_id, library_id)
 
@@ -7875,63 +7875,18 @@ def list_box_set(client, box_set_id, library_id):
 def list_seasons(client, series_id, library_id, page=None):
     """Display all seasons belonging to a series.
 
-    Library browsing already supplies the library ID because the user opened
-    the series from a specific library. Search results are different: Silo's
-    global catalog search intentionally does not include library membership on
-    the returned series card, while the v2 season/episode endpoints require a
-    positive library ID for the episode lookup.
-
-    When search opened this page without a library ID, resolve the series
-    against the user's accessible libraries and then carry the resolved ID
-    forward into every season URL.
+    The v2 seasons endpoint accepts a series ID directly. Preserve an optional
+    library ID when the user arrived from a library so Silo can apply that
+    library's metadata language and version-scoping rules, but never discover
+    a library for global Search or home-row results.
     """
     if not series_id:
         raise SiloError("No series ID was supplied.")
 
-    resolved_library_id = library_id
-    seasons = None
-
-    if resolved_library_id:
-        seasons = client.seasons(
-            series_id,
-            resolved_library_id,
-        )
-    else:
-        # A global search result does not identify which accessible library
-        # contains the series. Check each accessible library until the v2
-        # seasons endpoint returns a matching set of seasons.
-        libraries = client.libraries()
-
-        for library in libraries:
-            candidate_library_id = library.get("id")
-            if not candidate_library_id:
-                continue
-
-            try:
-                candidate_seasons = client.seasons(
-                    series_id,
-                    candidate_library_id,
-                    suppress_not_found=True,
-                )
-            except SiloError as exc:
-                log(
-                    "Unable to check series %s in library %s: %s"
-                    % (series_id, candidate_library_id, exc),
-                    xbmc.LOGDEBUG,
-                )
-                continue
-
-            if candidate_seasons:
-                resolved_library_id = candidate_library_id
-                seasons = candidate_seasons
-                break
-
-        if resolved_library_id is None:
-            raise SiloError(
-                "Unable to determine the Silo library for this TV show."
-            )
-
-    seasons = seasons or []
+    seasons = client.seasons(
+        series_id,
+        library_id or None,
+    ) or []
     page_items, has_previous, has_next = paginate_directory(
         seasons,
         page,
@@ -8215,46 +8170,6 @@ def list_episodes(client, series_id, season_number, library_id, page=None):
         )
 
     xbmcplugin.endOfDirectory(HANDLE)
-
-def resolve_playback_library_id(client, content_id, library_id=None):
-    """Resolve a playable item's library using the same pattern as search."""
-    if library_id not in (None, "", "None", "null"):
-        return library_id
-
-    libraries = client.libraries()
-
-    # Search does not always know which library a result came from. Mirror its
-    # resolution strategy here: test the item against each accessible library
-    # until Silo accepts one and returns the item's detail document.
-    for library in libraries:
-        candidate_library_id = library.get("id")
-        if candidate_library_id in (None, ""):
-            continue
-
-        try:
-            detail = client.item_detail(
-                content_id,
-                candidate_library_id,
-            )
-        except SiloError as exc:
-            log(
-                "Unable to check playback item %s in library %s: %s"
-                % (content_id, candidate_library_id, exc),
-                xbmc.LOGDEBUG,
-            )
-            continue
-
-        if detail:
-            log(
-                "Resolved playback library for %s: %s"
-                % (content_id, candidate_library_id),
-            )
-            return candidate_library_id
-
-    raise SiloError(
-        "Unable to determine the Silo library for this item."
-    )
-
 
 def _episode_number(value):
     try:
@@ -9035,15 +8950,9 @@ def play(
     if not content_id:
         raise SiloError("No content ID was supplied for playback.")
 
-    # Home and global-search items do not always carry a library ID. Resolve
-    # the item against the same accessible-library set used by search before
-    # asking Silo for versions or starting playback.
-    library_id = resolve_playback_library_id(
-        client,
-        content_id,
-        library_id,
-    )
-
+    # Library context is optional. Home/search items can be played directly
+    # by item/file ID; preserve library_id only when the originating directory
+    # supplied it so Silo can apply library-specific version scoping.
     use_kodi_resume_cache = use_kodi_resume_cache_enabled()
     kodi_cached_resume = (
         get_kodi_cached_resume_position()
@@ -11105,29 +11014,41 @@ def router(client):
 
         if media_type in ("episode", "season"):
             if not series_id:
-                item_library_id = resolve_playback_library_id(
-                    client, content_id, library_id
-                )
-                detail = client.item_detail(content_id, item_library_id) or {}
+                # Episode cards normally carry series_id. Older/incomplete
+                # cards can fall back to an item detail read without requiring
+                # a library lookup.
+                detail = client.item_detail(
+                    content_id,
+                    library_id or None,
+                ) or {}
                 series_id = str(
                     detail.get("series_id")
                     or detail.get("parent_series_id")
                     or ""
                 ).strip()
-                library_id = item_library_id
 
             if not series_id:
                 raise SiloError("Unable to determine the parent show for this item.")
 
-            library_id = resolve_playback_library_id(client, series_id, library_id)
+            # Browse the show directly. Keep library context only when the
+            # originating item actually supplied it.
             destination = build_url(
                 action="seasons",
                 series_id=series_id,
-                library_id=library_id,
+                library_id=library_id or None,
             )
-        elif media_type in ("movie", "series"):
-            library_id = resolve_playback_library_id(client, content_id, library_id)
+        elif media_type == "series":
+            destination = build_url(
+                action="seasons",
+                series_id=content_id,
+                library_id=library_id or None,
+            )
+        elif media_type == "movie" and library_id:
             destination = build_url(action="library", library_id=library_id)
+        elif media_type == "movie":
+            raise SiloError(
+                "This movie was opened outside a library, so it has no parent library page."
+            )
         else:
             raise SiloError("This item does not have a supported parent destination.")
 
