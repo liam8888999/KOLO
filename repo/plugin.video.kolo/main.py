@@ -8993,18 +8993,41 @@ def play(
         )
 
     latest_progress = None
+    watch_detail = None
 
     if not use_kodi_resume_cache:
         try:
-            latest_progress = client.get_progress(
+            # One targeted watch-state read supplies resume state and the
+            # selected file's marker/trickplay metadata; avoid /progress scans.
+            watch_detail = client.watch_detail(
                 content_id,
-                library_id,
+                library_id=library_id,
+                file_id=file_id,
+            )
+            latest_progress = client.progress_from_watch_detail(
+                watch_detail,
+                content_id,
             )
         except SiloError as exc:
-            log(
-                "Fresh progress lookup failed; continuing without Silo resume: %s" % exc,
-                xbmc.LOGWARNING,
-            )
+            if exc.status in (404, 501):
+                try:
+                    latest_progress = client.get_progress(
+                        content_id,
+                        library_id,
+                        watch_detail_loaded=True,
+                    )
+                except SiloError as fallback_exc:
+                    log(
+                        "Legacy progress fallback failed; continuing without Silo resume: %s"
+                        % fallback_exc,
+                        xbmc.LOGWARNING,
+                    )
+            else:
+                log(
+                    "Targeted Silo watch-state lookup failed; continuing without resume: %s"
+                    % exc,
+                    xbmc.LOGWARNING,
+                )
     else:
         log(
             "Using Kodi cached resume position %.3fs for content %s"
@@ -9260,14 +9283,23 @@ def play(
     # variables (content_id, file_id, library_id, detail).
     if ADDON.getSettingBool("skip_segments_enabled"):
         try:
-            versions = client.versions(content_id, library_id) or []
+            versions = (watch_detail or {}).get("versions") or []
             selected_version = next(
                 (
                     version for version in versions
-                    if str(version.get("id") or version.get("file_id") or "") == str(file_id)
+                    if str(version.get("file_id") or version.get("id") or "") == str(file_id)
                 ),
                 None,
             )
+            if selected_version is None:
+                versions = client.versions(content_id, library_id) or []
+                selected_version = next(
+                    (
+                        version for version in versions
+                        if str(version.get("id") or version.get("file_id") or "") == str(file_id)
+                    ),
+                    None,
+                )
             if selected_version is None and isinstance(detail, dict):
                 selected_version = (
                     detail.get("file_version")
