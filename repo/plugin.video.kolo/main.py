@@ -3076,7 +3076,7 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
     return item, media_type, content_id, title, display_progress
 
 
-def list_search_results(client, query, page=1):
+def list_search_results(client, query, page=1, cursor=None, window_cursor=None):
     """Display one page of Silo's server-side library-wide search results."""
     query = str(query or "").strip()
 
@@ -3106,11 +3106,20 @@ def list_search_results(client, query, page=1):
             query,
             limit=search_page_size,
             offset=offset,
+            cursor=cursor,
+            window_cursor=window_cursor,
+        )
+        search_capabilities = client.catalog_search_capabilities()
+        people_scope = (
+            "video_with_episodes"
+            if search_capabilities.get("video_with_episodes_scope") is True
+            else "video"
         )
         people_future = executor.submit(
             people_client.search_people,
             query,
             limit=50,
+            media_scope=people_scope,
         )
         box_sets_future = executor.submit(
             box_sets_client.search_box_sets,
@@ -3228,6 +3237,7 @@ def list_search_results(client, query, page=1):
                 action="search",
                 query=query,
                 page=page_number - 1,
+                window_cursor=data.get("window_cursor") or window_cursor or "",
             ),
             previous_item,
             True,
@@ -3369,6 +3379,8 @@ def list_search_results(client, query, page=1):
                 action="search",
                 query=query,
                 page=page_number + 1,
+                cursor=data.get("next_cursor") or "",
+                window_cursor=data.get("window_cursor") or window_cursor or "",
             ),
             next_item,
             True,
@@ -10996,6 +11008,8 @@ def router(client):
                 client,
                 query,
                 params.get("page"),
+                params.get("cursor"),
+                params.get("window_cursor"),
             )
         else:
             search_silo(client)
