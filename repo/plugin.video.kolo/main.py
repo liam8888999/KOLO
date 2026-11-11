@@ -1431,6 +1431,23 @@ def set_catalog_metadata(list_item, item, client):
     tag = list_item.getVideoInfoTag()
     media_type = (item.get("type") or item.get("media_type") or "").lower()
 
+    # New v2 artwork provenance lets skins distinguish an episode still from
+    # series artwork after the server's fallback selection.
+    for field, prop in (
+        ("poster_is_episode_still", "Kolo.Artwork.PosterIsEpisodeStill"),
+        ("backdrop_is_episode_still", "Kolo.Artwork.BackdropIsEpisodeStill"),
+        ("still_is_episode_still", "Kolo.Artwork.StillIsEpisodeStill"),
+    ):
+        if field in item:
+            list_item.setProperty(prop, "true" if item.get(field) is True else "false")
+
+    files = item.get("files") or []
+    if files and all(
+        isinstance(file_item, dict) and file_item.get("unreadable") is True
+        for file_item in files
+    ):
+        list_item.setProperty("Kolo.Unreadable", "true")
+
     # Kodi media types map Silo's catalog types to the native video types.
     kodi_media_type = {
         "movie": "movie",
@@ -1597,6 +1614,27 @@ def set_catalog_metadata(list_item, item, client):
             ratings[rating_type] = (float(value), 0)
         except (TypeError, ValueError):
             pass
+
+    # Episode rows use the newer CatalogRating array (score is 0-100),
+    # while older catalog cards expose the flat rating_* fields above.
+    for rating in item.get("ratings") or []:
+        if not isinstance(rating, dict):
+            continue
+        source = str(rating.get("name") or "").strip().lower()
+        rating_type = {
+            "imdb": "imdb",
+            "tmdb": "tmdb",
+            "rotten tomatoes critic": "rotten_tomatoes_critic",
+            "rotten tomatoes audience": "rotten_tomatoes_audience",
+        }.get(source)
+        if not rating_type or rating_type in ratings:
+            continue
+        try:
+            score = float(rating.get("score")) / 10.0
+        except (TypeError, ValueError):
+            continue
+        if 0 < score <= 10:
+            ratings[rating_type] = (score, 0)
 
     if ratings:
         default_rating = "imdb" if "imdb" in ratings else next(iter(ratings))
@@ -2066,7 +2104,11 @@ def set_detail_metadata(list_item, detail, client, file_id=None):
         list_item,
         client,
         poster=detail.get("poster_url") or detail.get("poster") or detail.get("image"),
-        backdrop=detail.get("backdrop_url") or detail.get("backdrop"),
+        backdrop=(
+            detail.get("backdrop_url")
+            or detail.get("backdrop")
+            or ((detail.get("backdrop_urls") or [None])[0])
+        ),
         logo=detail.get("logo_url") or detail.get("logo"),
         still=detail.get("still_url") or detail.get("still"),
         banner=detail.get("banner_url") or detail.get("banner"),
@@ -2568,7 +2610,11 @@ def add_catalog_item(client, item, library_id):
         list_item,
         client,
         poster=item.get("poster_url") or item.get("poster") or item.get("image") or item.get("artwork") or item.get("thumbnail"),
-        backdrop=item.get("backdrop_url") or item.get("backdrop"),
+        backdrop=(
+            item.get("backdrop_url")
+            or item.get("backdrop")
+            or ((item.get("backdrop_urls") or [None])[0])
+        ),
         logo=item.get("logo_url") or item.get("logo"),
         still=item.get("still_url") or item.get("still"),
         banner=item.get("banner_url") or item.get("banner"),
@@ -5849,7 +5895,11 @@ def _start_watch_party_guest_playback(
                 item,
                 client,
                 poster=detail.get("poster_url") or detail.get("poster"),
-                backdrop=detail.get("backdrop_url") or detail.get("backdrop"),
+                backdrop=(
+                    detail.get("backdrop_url")
+                    or detail.get("backdrop")
+                    or ((detail.get("backdrop_urls") or [None])[0])
+                ),
                 logo=detail.get("logo_url") or detail.get("logo"),
                 still=detail.get("still_url") or detail.get("still"),
             )
