@@ -67,7 +67,7 @@ def segments(version, offset=0.0):
             if not isinstance(marker, dict):
                 continue
             kind = str(marker.get("kind") or "").strip().lower()
-            if kind not in ("intro", "recap", "credits", "preview"):
+            if kind not in ("intro", "recap", "credits"):
                 continue
             span = _span(
                 marker.get("start_seconds", marker.get("start")),
@@ -80,7 +80,7 @@ def segments(version, offset=0.0):
 
     # Singular marker fields remain a compatibility fallback for older
     # servers and for a kind omitted from marker_segments.
-    for kind in ("intro", "recap", "credits", "preview"):
+    for kind in ("intro", "recap", "credits"):
         if any(item.get("kind") == kind for item in result):
             continue
         marker = version.get(kind)
