@@ -8256,13 +8256,37 @@ def resolve_playback_library_id(client, content_id, library_id=None):
     )
 
 
-def find_next_episode(client, current_episode, current_content_id, library_id):
-    """Find the next episode in the current series, independent of the launch list.
+def _episode_number(value):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
-    The current episode is located by its Silo content ID in the series' season
-    and episode endpoints. This works for Keep Watching, Home, Search, History,
-    and normal season browsing because none of those directory contexts is used
-    to infer the successor.
+
+def _ordered_season_episodes(episodes, season_number):
+    indexed = []
+    for index, episode in enumerate(episodes or []):
+        if not isinstance(episode, dict) or get_content_id(episode) in (None, ""):
+            continue
+        episode = dict(episode)
+        if episode.get("season_number") is None:
+            episode["season_number"] = season_number
+        number = _episode_number(
+            episode.get("episode_number", episode.get("number"))
+        )
+        # Preserve endpoint order when an episode has no explicit number.
+        sort_key = (0, number, index) if number is not None else (1, index, index)
+        indexed.append((sort_key, episode))
+    indexed.sort(key=lambda value: value[0])
+    return [episode for _key, episode in indexed]
+
+
+def find_next_episode(client, current_episode, current_content_id, library_id):
+    """Find the successor with the fewest season/episode API requests.
+
+    Only the current season and, when necessary, following seasons are fetched.
+    The old implementation downloaded every episode in every season even when
+    the next episode was in the current season.
     """
     if not isinstance(current_episode, dict):
         return None
@@ -8281,129 +8305,231 @@ def find_next_episode(client, current_episode, current_content_id, library_id):
         )
         return None
 
-    def number(value):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-
     seasons = client.seasons(series_id, library_id) or []
     ordered_seasons = []
     for index, season in enumerate(seasons):
         if not isinstance(season, dict):
             continue
-        season_number = number(
+        number = _episode_number(
             season.get("season_number", season.get("number"))
         )
-        if season_number is None:
-            continue
-        ordered_seasons.append((season_number, index))
-
+        if number is not None:
+            ordered_seasons.append((number, index))
     ordered_seasons.sort(key=lambda value: (value[0], value[1]))
 
-    ordered_episodes = []
-    for season_number, _season_index in ordered_seasons:
-        season_episodes = client.episodes(
-            series_id,
-            season_number,
-            library_id,
-        ) or []
-
-        indexed_episodes = []
-        for index, episode in enumerate(season_episodes):
-            if not isinstance(episode, dict):
-                continue
-
-            episode_id = get_content_id(episode)
-            if episode_id in (None, ""):
-                continue
-
-            episode = dict(episode)
-            if episode.get("season_number") is None:
-                episode["season_number"] = season_number
-
-            episode_number = number(
-                episode.get("episode_number", episode.get("number"))
-            )
-            # Prefer explicit episode numbering; retain the endpoint's order
-            # for any items that do not expose a numeric episode number.
-            if episode_number is None:
-                sort_key = (1, index, index)
-            else:
-                sort_key = (0, episode_number, index)
-
-            indexed_episodes.append((sort_key, episode))
-
-        indexed_episodes.sort(key=lambda value: value[0])
-        ordered_episodes.extend(
-            episode for _sort_key, episode in indexed_episodes
-        )
-
-    if not ordered_episodes:
+    if not ordered_seasons:
         return None
 
+    current_season = _episode_number(current_episode.get("season_number"))
+    if current_season is None:
+        season_data = current_episode.get("season")
+        if isinstance(season_data, dict):
+            current_season = _episode_number(
+                season_data.get("season_number", season_data.get("number"))
+            )
+
+    current_number = _episode_number(
+        current_episode.get("episode_number", current_episode.get("number"))
+    )
     current_id = str(current_content_id or "")
-    current_index = -1
-    for index, episode in enumerate(ordered_episodes):
-        if str(get_content_id(episode) or "") == current_id:
-            current_index = index
-            break
+    current_season_index = next(
+        (
+            index for index, (number, _original_index) in enumerate(ordered_seasons)
+            if current_season is not None and number == current_season
+        ),
+        None,
+    )
 
-    # Fall back to season/episode numbers if the card does not expose the same ID.
-    if current_index < 0:
-        current_season = number(current_episode.get("season_number"))
-        current_number = number(
-            current_episode.get("episode_number", current_episode.get("number"))
+    # When season metadata is available, start there rather than downloading
+    # every earlier season. If it is absent, retain the complete-search fallback.
+    start_index = current_season_index if current_season_index is not None else 0
+    current_found = False
+    episodes_by_season = {}
+
+    for season_index in range(start_index, len(ordered_seasons)):
+        season_number = ordered_seasons[season_index][0]
+        episodes = _ordered_season_episodes(
+            client.episodes(series_id, season_number, library_id),
+            season_number,
         )
-        if current_season is not None and current_number is not None:
-            for index, episode in enumerate(ordered_episodes):
-                season_number = number(episode.get("season_number"))
-                episode_number = number(
-                    episode.get("episode_number", episode.get("number"))
-                )
-                if (
-                    season_number == current_season
-                    and episode_number == current_number
-                ):
-                    current_index = index
-                    break
+        episodes_by_season[season_number] = episodes
 
-    if current_index < 0:
+        if not episodes:
+            continue
+
+        if not current_found:
+            match_index = next(
+                (
+                    index for index, episode in enumerate(episodes)
+                    if str(get_content_id(episode) or "") == current_id
+                ),
+                -1,
+            )
+            if match_index < 0 and current_season == season_number and current_number is not None:
+                match_index = next(
+                    (
+                        index for index, episode in enumerate(episodes)
+                        if _episode_number(episode.get("episode_number", episode.get("number")))
+                        == current_number
+                    ),
+                    -1,
+                )
+
+            if match_index >= 0:
+                current_found = True
+                if match_index + 1 < len(episodes):
+                    return episodes[match_index + 1]
+                # The current episode is the final item in this season. Continue
+                # with the next season, without fetching any earlier seasons.
+                continue
+
+            if current_season_index is not None:
+                # Metadata can occasionally report a season number that differs
+                # from the season endpoint. Preserve the old full-series lookup
+                # as a correctness fallback, reusing the season already fetched.
+                log(
+                    "Current episode %s was not found in its reported season %s; "
+                    "falling back to a full series scan."
+                    % (current_content_id, season_number),
+                    xbmc.LOGDEBUG,
+                )
+                ordered_episodes = []
+                for fallback_number, _original_index in ordered_seasons:
+                    fallback_episodes = episodes_by_season.get(fallback_number)
+                    if fallback_episodes is None:
+                        fallback_episodes = _ordered_season_episodes(
+                            client.episodes(series_id, fallback_number, library_id),
+                            fallback_number,
+                        )
+                        episodes_by_season[fallback_number] = fallback_episodes
+                    ordered_episodes.extend(fallback_episodes)
+
+                fallback_index = next(
+                    (
+                        index for index, episode in enumerate(ordered_episodes)
+                        if str(get_content_id(episode) or "") == current_id
+                    ),
+                    -1,
+                )
+                if fallback_index < 0 and current_number is not None:
+                    fallback_index = next(
+                        (
+                            index for index, episode in enumerate(ordered_episodes)
+                            if _episode_number(episode.get("season_number")) == current_season
+                            and _episode_number(
+                                episode.get("episode_number", episode.get("number"))
+                            ) == current_number
+                        ),
+                        -1,
+                    )
+                if fallback_index >= 0 and fallback_index + 1 < len(ordered_episodes):
+                    return ordered_episodes[fallback_index + 1]
+                return None
+            continue
+
+        # Once the current episode has been found, the first episode in the
+        # next non-empty season is its successor.
+        return episodes[0]
+
+    if not current_found:
         log(
             "Current episode %s was not found in the episode list for series %s."
             % (current_content_id, series_id),
             xbmc.LOGWARNING,
         )
-        return None
-
-    next_index = current_index + 1
-    if next_index >= len(ordered_episodes):
+    else:
         log(
             "Episode %s is the final available episode in series %s."
             % (current_content_id, series_id),
             xbmc.LOGDEBUG,
         )
-        return None
-
-    return ordered_episodes[next_index]
+    return None
 
 
-def _auto_play_next_episode(client, current_episode, current_content_id, library_id):
-    """Queue the next episode after a natural playback end."""
-    try:
-        next_episode = find_next_episode(
-            client,
-            current_episode,
-            current_content_id,
-            library_id,
-        )
-    except Exception as exc:
-        log(
-            "Unable to resolve the next episode after %s: %s"
-            % (current_content_id, exc),
-            xbmc.LOGWARNING,
-        )
-        return
+def _start_next_episode_prefetch(client, current_episode, current_content_id, library_id):
+    """Resolve the next episode in a worker while the current item is playing."""
+    state = {
+        "event": threading.Event(),
+        "episode": None,
+        "error": None,
+        "elapsed": 0.0,
+    }
+
+    def resolve():
+        started = time.monotonic()
+        try:
+            # Keep background catalog reads on their own requests.Session.
+            # The main client is concurrently used by playback-progress updates.
+            prefetch_client = SiloClient()
+            prefetch_client.cfg.update(client.cfg)
+            state["episode"] = find_next_episode(
+                prefetch_client,
+                current_episode,
+                current_content_id,
+                library_id,
+            )
+        except Exception as exc:
+            state["error"] = exc
+        finally:
+            state["elapsed"] = time.monotonic() - started
+            state["event"].set()
+            log(
+                "Next-episode pre-resolution finished in %.3fs for %s."
+                % (state["elapsed"], current_content_id),
+                xbmc.LOGDEBUG,
+            )
+
+    worker = threading.Thread(
+        target=resolve,
+        name="KoloNextEpisodePrefetch",
+    )
+    worker.daemon = True
+    state["thread"] = worker
+    worker.start()
+    log(
+        "Started background next-episode pre-resolution for %s."
+        % current_content_id,
+        xbmc.LOGDEBUG,
+    )
+    return state
+
+
+def _auto_play_next_episode(
+    client,
+    current_episode,
+    current_content_id,
+    library_id,
+    prefetch=None,
+):
+    """Start the pre-resolved successor after a natural playback end."""
+    started = time.monotonic()
+    if prefetch is not None:
+        # This normally completes during playback. Waiting here is only a
+        # safety net for unusually slow catalog responses.
+        prefetch["event"].wait()
+        next_episode = prefetch.get("episode")
+        if prefetch.get("error") is not None:
+            log(
+                "Unable to resolve the next episode after %s: %s"
+                % (current_content_id, prefetch["error"]),
+                xbmc.LOGWARNING,
+            )
+            return
+    else:
+        try:
+            next_episode = find_next_episode(
+                client,
+                current_episode,
+                current_content_id,
+                library_id,
+            )
+        except Exception as exc:
+            log(
+                "Unable to resolve the next episode after %s: %s"
+                % (current_content_id, exc),
+                xbmc.LOGWARNING,
+            )
+            return
 
     if not next_episode:
         log(
@@ -8438,12 +8564,11 @@ def _auto_play_next_episode(client, current_episode, current_content_id, library
     next_url = build_url(**params)
     next_title = next_episode.get("title") or next_episode.get("name") or str(next_content_id)
     log(
-        "Automatically starting next episode: %s (%s)."
-        % (next_title, next_content_id),
+        "Automatically starting next episode: %s (%s); handoff preparation took %.3fs."
+        % (next_title, next_content_id, time.monotonic() - started),
         xbmc.LOGINFO,
     )
     xbmc.executebuiltin('PlayMedia("%s")' % next_url)
-
 
 def _version_codec_label(value):
     """Return a readable codec name for the version picker."""
@@ -9185,6 +9310,26 @@ def play(
     # back. Startup decoder failures can happen before the progress monitor
     # begins, so its callback object must already exist.
     playback_player = _KoloPlaybackPlayer()
+
+    # Resolve the successor while the current episode is playing so the
+    # natural-end path does not have to enumerate the series synchronously.
+    next_episode_prefetch = None
+    if (
+        auto_play_next_episode_enabled()
+        and isinstance(detail, dict)
+        and (
+            detail.get("series_id")
+            or detail.get("parent_series_id")
+            or isinstance(detail.get("series"), dict)
+        )
+    ):
+        next_episode_prefetch = _start_next_episode_prefetch(
+            client,
+            detail,
+            content_id,
+            library_id,
+        )
+
     xbmcplugin.setResolvedUrl(
         HANDLE,
         True,
@@ -9268,6 +9413,7 @@ def play(
             detail,
             content_id,
             library_id,
+            prefetch=next_episode_prefetch,
         )
 
 def playback_session_was_terminated(exc):
