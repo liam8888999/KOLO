@@ -2373,10 +2373,13 @@ class SiloClient:
         return result
 
     # Return the newest Silo progress record for one catalog media item.
-    def get_progress(self, content_id, library_id=None):
+    def get_progress(self, content_id, library_id=None, watch_detail=None,
+                     watch_detail_loaded=False):
         """Read one item's authoritative progress without paging all history."""
         try:
-            detail = self.watch_detail(content_id, library_id=library_id)
+            detail = watch_detail if watch_detail_loaded else self.watch_detail(
+                content_id, library_id=library_id
+            )
         except SiloError as exc:
             # Retain compatibility with older v2 deployments that predate
             # getWatchState. A missing user_data on a successful watch read is
