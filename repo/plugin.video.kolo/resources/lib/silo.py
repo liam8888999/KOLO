@@ -2605,6 +2605,7 @@ class SiloClient:
         direct_play_only=False, kodi_source_version=None
     ):
         caps = self.playback_caps()
+        supported_features = set(caps.get("features") or [])
         pv = self._protocol_version()
         output_hdr_details = _kodi_output_hdr_details()
         quality_preference = str(quality_preference or "auto").strip()
@@ -2770,7 +2771,6 @@ class SiloClient:
             hls_delivery["enabled"] = False
             hls_delivery["supported_on_device"] = False
 
-        supported_features = set(caps.get("features") or [])
         client_features = ["playback_plan_v3", "seek_reanchor_v1"]
         # Kodi's native player supports SRT sidecars and can consume the
         # original SubRip file without a server-side WebVTT conversion.
