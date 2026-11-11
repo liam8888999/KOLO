@@ -1538,6 +1538,17 @@ def set_catalog_metadata(list_item, item, client):
                 str(item["original_language"]),
             )
 
+    if item.get("play_content_id"):
+        list_item.setProperty(
+            "Kolo.PlayTargetContentID",
+            str(item.get("play_content_id")),
+        )
+    if item.get("play_season_number") is not None:
+        list_item.setProperty(
+            "Kolo.PlayTargetSeason",
+            str(item.get("play_season_number")),
+        )
+
     series_title = (
         item.get("series_title")
         or item.get("series_name")
