@@ -10072,6 +10072,13 @@ def track_progress(
     stall_started_at = None
     caching_started_at = None
     post_switch_grace_until = 0.0
+    playback_metrics_started_at = time.time()
+    last_metrics_sample_at = playback_metrics_started_at
+    played_seconds = 0.0
+    stall_count = 0
+    stall_total_seconds = 0.0
+    stall_longest_seconds = 0.0
+    buffering_action = "none"
 
     # Downward changes happen relatively quickly once sustained buffering is
     # detected. Upward changes require a longer healthy period and must also pass
@@ -10234,6 +10241,12 @@ def track_progress(
 
         position = max(0.0, position)
         paused = bool(xbmc.getCondVisibility("Player.Paused"))
+        if not paused:
+            played_seconds += max(
+                0.0,
+                min(2.0, now - last_metrics_sample_at),
+            )
+        last_metrics_sample_at = now
 
         # Kodi time can move backwards on resume/jump-back, or jump forwards
         # during a seek/fast-forward. Neither is evidence of a network stall.
@@ -10367,6 +10380,7 @@ def track_progress(
 
                 if position_stalled or caching_stalled:
                     if stall_started_at is None:
+                        stall_count += 1
                         reasons = []
                         if caching_stalled:
                             reasons.append("Kodi caching")
@@ -10411,6 +10425,12 @@ def track_progress(
                             )
 
                     if stall_started_at is not None:
+                        recovered_stall = max(0.0, now - stall_started_at)
+                        stall_total_seconds += recovered_stall
+                        stall_longest_seconds = max(
+                            stall_longest_seconds,
+                            recovered_stall,
+                        )
                         if progress_confirmed:
                             healthy_since = now
                         stall_started_at = None
@@ -10556,6 +10576,7 @@ def track_progress(
                             known_good_since = switch_time
                             probe_quality = None
 
+                            buffering_action = "downshift"
                             last_down_replan_at = switch_time
                             last_up_replan_at = 0.0
                             downshift_retry_at = 0.0
@@ -10939,6 +10960,37 @@ def track_progress(
 
     def finish_session():
         try:
+            if (
+                "playback_plan_summary_v1"
+                in (playback_info.get("client_features") or [])
+            ):
+                final_stall = (
+                    max(0.0, time.time() - stall_started_at)
+                    if stall_started_at is not None
+                    else 0.0
+                )
+                total_stall = stall_total_seconds + final_stall
+                longest_stall = max(stall_longest_seconds, final_stall)
+                try:
+                    client.report_route_event(
+                        playback_info,
+                        "plan_summary",
+                        diagnostics={
+                            "played_ms": int(played_seconds * 1000),
+                            "stall_count": stall_count,
+                            "stall_total_ms": int(total_stall * 1000),
+                            "stall_longest_ms": int(longest_stall * 1000),
+                            "buffering_mode": (
+                                "direct_play_only" if direct_play_only else "adaptive"
+                            ),
+                            "buffering_action": buffering_action,
+                        },
+                    )
+                except Exception as telemetry_exc:
+                    log(
+                        "Unable to report Silo playback summary: %s" % telemetry_exc,
+                        xbmc.LOGDEBUG,
+                    )
             client.stop_playback(
                 session_id,
                 sequence,
