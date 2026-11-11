@@ -662,7 +662,11 @@ class SiloClient:
             try:
                 r = self.session.request(
                     method,
-                    self.base + path,
+                    (
+                        path
+                        if str(path).startswith(("http://", "https://"))
+                        else self.base + path
+                    ),
                     headers=headers,
                     params=params,
                     json=body,
@@ -2527,9 +2531,16 @@ class SiloClient:
         bytes_received = 0
         now = None
         try:
+            # Prefer the server-advertised media-path probe. It follows the
+            # same direct-play egress route as media, which can differ from the
+            # API origin when Silo serves files through a proxy or remote node.
+            probe_url = (
+                caps.get("bandwidth_probe_url")
+                or "/api/v2/playback/bandwidth-probe"
+            )
             response = self._send(
                 "GET",
-                "/api/v2/playback/bandwidth-probe",
+                probe_url,
                 params={"size": 40000000},
                 need_profile=False,
                 timeout=(5, 2),
