@@ -1872,8 +1872,8 @@ class SiloClient:
         except (TypeError, ValueError):
             limit = 20
 
-        capabilities = self.catalog_search_capabilities()
         if media_scope is None:
+            capabilities = self.catalog_search_capabilities()
             media_scope = (
                 "video_with_episodes"
                 if capabilities.get("video_with_episodes_scope") is True
@@ -2732,13 +2732,9 @@ class SiloClient:
         hls_delivery["features"] = hls_features
         deliveries["hls"] = hls_delivery
 
-        progressive_features = list(progressive_delivery.get("features") or [])
-        if (
-            "progressive_range_refusal_v1" in supported_features
-            and "progressive_range_refusal_v1" not in progressive_features
-        ):
-            progressive_features.append("progressive_range_refusal_v1")
-        progressive_delivery["features"] = progressive_features
+        # Do not advertise progressive_range_refusal_v1 until Kodi exposes
+        # a reliable HTTP 409/range-refusal callback that KOLO can use to
+        # reopen the remux at the current source position.
 
         # These declarations are about what the active output can display,
         # not what the server can encode. Replace any generic/server-default
@@ -2765,10 +2761,10 @@ class SiloClient:
 
         supported_features = set(caps.get("features") or [])
         client_features = ["playback_plan_v3", "seek_reanchor_v1"]
-        # The Kodi skip tracker consumes every marker occurrence, rather than
-        # collapsing repeated intros/credits into one broad range.
-        if "marker_segments_v1" in supported_features:
-            client_features.append("marker_segments_v1")
+        # Kodi's native player supports SRT sidecars and can consume the
+        # original SubRip file without a server-side WebVTT conversion.
+        if "subrip_sidecar_v1" in supported_features:
+            client_features.append("subrip_sidecar_v1")
         # Enable server-side learned buffering limits only on servers that
         # explicitly advertise the v2 feature.
         if "buffering_quality_v1" in supported_features:
