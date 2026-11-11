@@ -7896,7 +7896,7 @@ def list_seasons(client, series_id, library_id, page=None):
 
     add_previous_page(
         series_id=series_id,
-        library_id=resolved_library_id,
+        library_id=library_id,
         action="seasons",
         page=page,
     )
@@ -7931,7 +7931,7 @@ def list_seasons(client, series_id, library_id, page=None):
                 action="season",
                 series_id=series_id,
                 season_number=season_number,
-                library_id=resolved_library_id,
+                library_id=library_id,
             ),
             item,
             True,
@@ -7940,7 +7940,7 @@ def list_seasons(client, series_id, library_id, page=None):
     if has_next:
         add_next_page(
             series_id=series_id,
-            library_id=resolved_library_id,
+            library_id=library_id,
             action="seasons",
             page=page,
         )
