@@ -9365,6 +9365,21 @@ def play(
             if spans:
                 info["_silo_skip_spans"] = spans
                 info["_silo_content_id"] = str(content_id)
+            if selected_version:
+                resolved_item.setProperty(
+                    "Kolo.TrickplayAvailable",
+                    "true" if selected_version.get("trickplay_available") is True else "false",
+                )
+                marker_segments = selected_version.get("marker_segments")
+                if marker_segments:
+                    resolved_item.setProperty(
+                        "Kolo.MarkerSegments",
+                        json.dumps(
+                            marker_segments,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
+                    )
         except Exception as exc:
             log(
                 "Unable to load Silo skip markers for %s: %s"
@@ -10130,6 +10145,15 @@ def track_progress(
     stall_longest_seconds = 0.0
     buffering_action = "none"
 
+    def close_stall(at):
+        nonlocal stall_started_at, stall_total_seconds, stall_longest_seconds
+        if stall_started_at is None:
+            return
+        elapsed = max(0.0, float(at) - stall_started_at)
+        stall_total_seconds += elapsed
+        stall_longest_seconds = max(stall_longest_seconds, elapsed)
+        stall_started_at = None
+
     # Downward changes happen relatively quickly once sustained buffering is
     # detected. Upward changes require a longer healthy period and must also pass
     # the per-quality failure cooldown before a higher rung is probed.
@@ -10191,7 +10215,7 @@ def track_progress(
                 progress_confirmed = False
                 healthy_since = 0.0
                 caching_started_at = None
-                stall_started_at = None
+                close_stall(time.time())
                 post_switch_grace_until = time.time() + 15.0
                 continue
             log(
@@ -10238,7 +10262,7 @@ def track_progress(
                             last_progress_position = target
                             last_progress_change_at = time.time()
                             caching_started_at = None
-                            stall_started_at = None
+                            close_stall(time.time())
                             seek_grace_until = time.time() + 8.0
                             log("Skipped %s to %.1fs" % (kind, target), xbmc.LOGINFO)
                         except Exception as exc:
@@ -10316,7 +10340,7 @@ def track_progress(
                 last_progress_position = position
                 last_progress_change_at = now
                 caching_started_at = None
-                stall_started_at = None
+                close_stall(now)
                 seek_grace_until = now + 8.0
                 healthy_since = now if progress_confirmed and not paused else 0.0
                 log(
@@ -10339,7 +10363,7 @@ def track_progress(
                 )
 
             caching_started_at = None
-            stall_started_at = None
+            close_stall(now)
             healthy_since = 0.0
         elif last_paused is True:
             # Start a completely fresh health/stall measurement when playback
@@ -10348,7 +10372,7 @@ def track_progress(
             last_progress_position = position
             last_progress_change_at = now
             caching_started_at = None
-            stall_started_at = None
+            close_stall(now)
             healthy_since = now
             log(
                 "Kodi playback resumed; resetting adaptive quality timers.",
@@ -10399,7 +10423,7 @@ def track_progress(
 
             if in_post_switch_grace or in_seek_grace:
                 caching_started_at = None
-                stall_started_at = None
+                close_stall(now)
                 stalled_for = 0.0
 
                 # Start the no-progress timer from the end of the grace window,
@@ -10475,15 +10499,9 @@ def track_progress(
                             )
 
                     if stall_started_at is not None:
-                        recovered_stall = max(0.0, now - stall_started_at)
-                        stall_total_seconds += recovered_stall
-                        stall_longest_seconds = max(
-                            stall_longest_seconds,
-                            recovered_stall,
-                        )
+                        close_stall(now)
                         if progress_confirmed:
                             healthy_since = now
-                        stall_started_at = None
 
                     if healthy_since <= 0 and progress_confirmed:
                         healthy_since = now
@@ -10639,7 +10657,7 @@ def track_progress(
                             post_switch_grace_until = (
                                 last_down_replan_at + 15.0
                             )
-                            stall_started_at = None
+                            close_stall(time.time())
 
                             log(
                                 "Adaptive downshift complete: %s -> %s"
@@ -11026,7 +11044,9 @@ def track_progress(
                         playback_info,
                         "plan_summary",
                         diagnostics={
-                            "played_ms": int(played_seconds * 1000),
+                            "played_ms": int(
+                                max(0.0, played_seconds - total_stall) * 1000
+                            ),
                             "stall_count": stall_count,
                             "stall_total_ms": int(total_stall * 1000),
                             "stall_longest_ms": int(longest_stall * 1000),
