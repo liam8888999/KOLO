@@ -2773,6 +2773,8 @@ class SiloClient:
         # explicitly advertise the v2 feature.
         if "buffering_quality_v1" in supported_features:
             client_features.append("buffering_quality_v1")
+        if "playback_plan_summary_v1" in supported_features:
+            client_features.append("playback_plan_summary_v1")
         # Kodi's native player can consume the HLS SUBTITLES group. Add the
         # optional rendition features only when this server advertises them.
         if "hls_subtitle_renditions_v1" in supported_features:
@@ -2934,6 +2936,11 @@ class SiloClient:
 
         if bandwidth_estimate_kbps is not None:
             body["bandwidth_estimate_kbps"] = bandwidth_estimate_kbps
+            if (
+                "buffering_quality_v1" in body.get("client_features", [])
+                and quality_preference == "auto"
+            ):
+                body["bandwidth_estimate_source"] = "probe"
 
         data = self._json(
             "POST",
@@ -3286,6 +3293,37 @@ class SiloClient:
                 "is_paused": bool(paused),
             },
         )
+
+    # Send one v2 playback telemetry event. Route events are best-effort:
+    # failures must never interrupt playback or session cleanup.
+    def report_route_event(self, playback_info, event, diagnostics=None):
+        info = playback_info or {}
+        plan = info.get("playback_plan") or {}
+        attempt_id = str(info.get("playback_attempt_id") or "")
+        if not attempt_id:
+            return False
+        body = {
+            "protocol_version": 3,
+            "playback_attempt_id": attempt_id,
+            "session_id": str(info.get("session_id") or ""),
+            "plan_id": str(plan.get("plan_id") or ""),
+            "plan_attempt_id": str(info.get("plan_attempt_id") or ""),
+            "plan_attempt_key": str(plan.get("plan_attempt_key") or ""),
+            "event": str(event or ""),
+        }
+        if diagnostics:
+            body["diagnostics"] = {
+                str(key): str(value)
+                for key, value in diagnostics.items()
+                if value is not None
+            }
+        self._send(
+            "POST",
+            "/api/v2/playback/route-events",
+            body=body,
+            timeout=10,
+        )
+        return True
 
     # Tell Silo that the playback session ended.
     def stop_playback(self, session_id, sequence, position):
