@@ -22,7 +22,6 @@
 * Fetch only the current and subsequent seasons when locating the next episode, avoiding unnecessary full-series API requests
 * Isolate background episode lookups from playback-progress network activity, while retaining a full-series fallback when season metadata does not match
 
-V1.1.27
 * Fix autoplay next episode occasionally failing to start after natural playback completion
 * Keep the Kodi playback callback alive while waiting for the end event, including playback started without a Silo session
 * Distinguish natural completion from manual stops and playback errors before launching the next episode
