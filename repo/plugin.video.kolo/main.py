@@ -41,6 +41,7 @@ import os
 import socket
 import ssl
 import struct
+import queue
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import parse_qsl, urlencode, urlparse
@@ -3075,6 +3076,69 @@ def add_catalog_context_menu(list_item, catalog_item):
     except (AttributeError, RuntimeError, TypeError) as exc:
         log("Unable to attach Silo title actions: %s" % exc, xbmc.LOGDEBUG)
 
+def _set_marker_preview_properties(list_item, marker_segments):
+    """Expose marker ranges as individual skin-readable Kodi properties."""
+    markers = [item for item in (marker_segments or []) if isinstance(item, dict)]
+    list_item.setProperty("Kolo.Marker.Count", str(len(markers)))
+    for index, marker in enumerate(markers):
+        prefix = "Kolo.Marker.%d." % index
+        list_item.setProperty(prefix + "Kind", str(marker.get("kind") or ""))
+        list_item.setProperty(prefix + "Start", str(marker.get("start_seconds", marker.get("start", ""))))
+        list_item.setProperty(prefix + "End", str(marker.get("end_seconds", marker.get("end", ""))))
+        list_item.setProperty(prefix + "Thumbnail", str(marker.get("thumbnail_url") or ""))
+
+
+def _set_trickplay_preview_properties(list_item, manifest):
+    """Expose seek-sheet geometry and URLs as simple skin InfoLabels."""
+    manifest = manifest if isinstance(manifest, dict) else {}
+    for field, suffix in (
+        ("interval_ms", "IntervalMs"),
+        ("thumbnail_width", "ThumbnailWidth"),
+        ("thumbnail_height", "ThumbnailHeight"),
+        ("tile_columns", "TileColumns"),
+        ("tile_rows", "TileRows"),
+        ("thumbnail_count", "ThumbnailCount"),
+        ("expires_at", "ExpiresAt"),
+    ):
+        if manifest.get(field) is not None:
+            list_item.setProperty("Kolo.Trickplay." + suffix, str(manifest[field]))
+    sheets = manifest.get("sheets") or manifest.get("sheet_urls") or []
+    list_item.setProperty("Kolo.Trickplay.SheetCount", str(len(sheets)))
+    for index, sheet in enumerate(sheets):
+        url = sheet.get("url") if isinstance(sheet, dict) else sheet
+        if url:
+            list_item.setProperty("Kolo.Trickplay.Sheet.%d" % index, str(url))
+
+
+def _episode_is_unwatched(progress, catalog_item=None):
+    """Apply Silo's definition: not played and no active/positive progress."""
+    state = progress if isinstance(progress, dict) else {}
+    if not state and isinstance(catalog_item, dict):
+        state = catalog_item.get("user_data") or catalog_item.get("user_state") or {}
+    if not isinstance(state, dict):
+        state = {}
+    def enabled(value):
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+    if enabled(state.get("played")) or enabled(state.get("completed")):
+        return False
+    try:
+        position = float(state.get("position_seconds") or 0)
+    except (TypeError, ValueError):
+        position = 0.0
+    return not enabled(state.get("is_in_progress")) and position <= 0.0
+
+
+def _episode_spoiler_preferences(client):
+    try:
+        return client.episode_spoiler_settings()
+    except Exception as exc:
+        log("Unable to resolve episode spoiler preferences: %s" % exc, xbmc.LOGDEBUG)
+        return {}
+
+
 def build_catalog_list_item(client, catalog_item, detail=None, progress=None, series_rollup=None, season_rollup=None, accessed_from_parent=False):
     """Build a Kodi ListItem using the same metadata/watch pipeline everywhere."""
     content_id = get_content_id(catalog_item)
@@ -3087,37 +3151,54 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
     item.getVideoInfoTag().setTitle(title)
 
     set_catalog_metadata(item, catalog_item, client)
+    spoiler = _episode_spoiler_preferences(client) if media_type == "episode" else {}
+    unwatched = media_type == "episode" and _episode_is_unwatched(progress, catalog_item)
+    hide_episode_image = unwatched and spoiler.get("catalog.hide_unwatched_episode_images", False)
+    hide_episode_overview = unwatched and spoiler.get("catalog.hide_unwatched_episode_overviews", False)
+    poster = (
+        catalog_item.get("poster_url") or catalog_item.get("poster")
+        or catalog_item.get("image") or catalog_item.get("artwork")
+        or catalog_item.get("thumbnail") or (detail or {}).get("poster_url")
+        or (detail or {}).get("poster") or (detail or {}).get("image")
+    )
+    backdrop = (
+        catalog_item.get("backdrop_url") or catalog_item.get("backdrop")
+        or ((catalog_item.get("backdrop_urls") or [None])[0])
+        or (detail or {}).get("backdrop_url") or (detail or {}).get("backdrop")
+        or (((detail or {}).get("backdrop_urls") or [None])[0])
+    )
+    if hide_episode_image:
+        # Unknown provenance is protected conservatively. Prefer known show
+        # artwork where possible; never expose the episode still as a fallback.
+        if catalog_item.get("poster_is_episode_still", (detail or {}).get("poster_is_episode_still")) is not False:
+            poster = None
+        if catalog_item.get("backdrop_is_episode_still", (detail or {}).get("backdrop_is_episode_still")) is not False:
+            backdrop = None
+        item.setProperty("Kolo.SpoilerProtected", "true")
     set_art(
-        item,
-        client,
-        poster=(
-            catalog_item.get("poster_url")
-            or catalog_item.get("poster")
-            or catalog_item.get("image")
-            or catalog_item.get("artwork")
-            or catalog_item.get("thumbnail")
-            or (detail or {}).get("poster_url")
-            or (detail or {}).get("poster")
-            or (detail or {}).get("image")
-        ),
-        backdrop=(
-            catalog_item.get("backdrop_url")
-            or catalog_item.get("backdrop")
-            or ((catalog_item.get("backdrop_urls") or [None])[0])
-            or (detail or {}).get("backdrop_url")
-            or (detail or {}).get("backdrop")
-            or (((detail or {}).get("backdrop_urls") or [None])[0])
-        ),
+        item, client, poster=poster, backdrop=backdrop,
         logo=catalog_item.get("logo_url") or catalog_item.get("logo") or (detail or {}).get("logo_url") or (detail or {}).get("logo"),
-        still=catalog_item.get("still_url") or catalog_item.get("still") or (detail or {}).get("still_url") or (detail or {}).get("still"),
+        still=None if hide_episode_image else (catalog_item.get("still_url") or catalog_item.get("still") or (detail or {}).get("still_url") or (detail or {}).get("still")),
         banner=catalog_item.get("banner_url") or catalog_item.get("banner") or (detail or {}).get("banner_url") or (detail or {}).get("banner"),
         clearart=catalog_item.get("clear_art_url") or catalog_item.get("clearart_url") or catalog_item.get("clearart") or (detail or {}).get("clear_art_url") or (detail or {}).get("clearart_url") or (detail or {}).get("clearart"),
         discart=catalog_item.get("disc_url") or catalog_item.get("discart_url") or catalog_item.get("discart") or (detail or {}).get("disc_url") or (detail or {}).get("discart_url") or (detail or {}).get("discart"),
         landscape=catalog_item.get("landscape_url") or catalog_item.get("landscape") or (detail or {}).get("landscape_url") or (detail or {}).get("landscape") or (detail or {}).get("thumb_url"),
     )
-
     if detail:
         set_detail_metadata(item, detail, client)
+
+    if hide_episode_image:
+        # Detail hydration runs after card construction and may reapply the
+        # still. Clear only artwork whose provenance is unknown/episode-specific.
+        if poster is None:
+            item.setArt({"poster": "", "thumb": "", "landscape": ""})
+        if backdrop is None:
+            item.setArt({"fanart": ""})
+        item.setArt({"still": ""})
+    if hide_episode_overview:
+        item.getVideoInfoTag().setPlot("")
+        item.getVideoInfoTag().setPlotOutline("")
+        item.setProperty("Kolo.SpoilerOverviewHidden", "true")
 
     display_progress = progress if progress is not None else catalog_progress(catalog_item)
     set_watch_state(item, display_progress, media_type)
@@ -4054,13 +4135,15 @@ def _watch_party_leave():
 class _SiloWebSocket:
     """Minimal RFC 6455 WebSocket client for Silo's room protocol."""
 
-    def __init__(self, url, protocols, timeout=15, origin=None):
+    def __init__(self, url, protocols=None, timeout=15, origin=None, headers=None):
         self.url = url
         self.protocols = list(protocols or [])
         self.timeout = float(timeout or 15)
         self.origin = str(origin or "").strip()
+        self.headers = dict(headers or {})
         self.sock = None
         self._buffer = b""
+        self._send_lock = threading.Lock()
 
     def connect(self):
         parsed = urlparse(self.url)
@@ -4135,22 +4218,20 @@ class _SiloWebSocket:
 
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (
-            "GET %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Origin: %s\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Key: %s\r\n"
-            "Sec-WebSocket-Version: 13\r\n"
-            "Sec-WebSocket-Protocol: %s\r\n"
-            "\r\n"
-        ) % (
-            path,
-            host_header,
-            self.origin,
-            key,
-            ", ".join(self.protocols),
-        )
+            "GET %s HTTP/1.1\\r\\n"
+            "Host: %s\\r\\n"
+            "Origin: %s\\r\\n"
+            "Upgrade: websocket\\r\\n"
+            "Connection: Upgrade\\r\\n"
+            "Sec-WebSocket-Key: %s\\r\\n"
+            "Sec-WebSocket-Version: 13\\r\\n"
+        ) % (path, host_header, self.origin, key)
+        for header_name, header_value in self.headers.items():
+            safe_value = str(header_value).encode("ascii", "ignore").decode("ascii")
+            request += "%s: %s\\r\\n" % (header_name, safe_value)
+        if self.protocols:
+            request += "Sec-WebSocket-Protocol: %s\\r\\n" % ", ".join(self.protocols)
+        request += "\\r\\n"
 
         try:
             self.sock.sendall(request.encode("ascii"))
@@ -4222,11 +4303,9 @@ class _SiloWebSocket:
             self.close()
             raise SiloError("Invalid Watch Party WebSocket handshake response.")
 
-        if headers.get("sec-websocket-protocol", "").strip() != "silo.room.v2":
+        if self.protocols and headers.get("sec-websocket-protocol", "").strip() not in self.protocols:
             self.close()
-            raise SiloError(
-                "Silo did not select the expected Watch Party socket protocol."
-            )
+            raise SiloError("Silo did not select the expected WebSocket subprotocol.")
 
         # Keep the room monitor responsive enough to immediately undo
         # unauthorized Kodi pause/seek actions.
@@ -4356,7 +4435,10 @@ class _SiloWebSocket:
             for index, value in enumerate(payload)
         )
 
-        self.sock.sendall(header + mask + masked)
+        with self._send_lock:
+            if self.sock is None:
+                raise SiloError("WebSocket is closed.")
+            self.sock.sendall(header + mask + masked)
 
     def close(self):
         sock = self.sock
@@ -8079,6 +8161,7 @@ def list_episodes(client, series_id, season_number, library_id, page=None):
         library_id=library_id,
     )
 
+    spoiler_settings = _episode_spoiler_preferences(client)
     batch = []
 
     for episode in episodes:
@@ -8172,36 +8255,63 @@ def list_episodes(client, series_id, season_number, library_id, page=None):
             except (TypeError, ValueError):
                 pass
 
-        plot = metadata_episode.get("overview") or metadata_episode.get("plot")
-        if plot:
-            tag.setPlot(str(plot))
-            tag.setPlotOutline(str(plot))
-
-        set_art(
-            item,
-            client,
-            poster=(
-                metadata_episode.get("poster_url")
-                or metadata_episode.get("poster")
-                or metadata_episode.get("image")
-                or metadata_episode.get("thumbnail")
-            ),
-            backdrop=metadata_episode.get("backdrop_url"),
-            logo=metadata_episode.get("logo_url"),
-            still=(
-                metadata_episode.get("still_url")
-                or metadata_episode.get("still")
-            ),
-        )
-
-        if detail:
-            set_detail_metadata(item, detail, client)
-
         display_progress = (
             progress_map.get(str(content_id))
             or catalog_progress(detail)
             or catalog_progress(episode)
         )
+        unwatched = _episode_is_unwatched(display_progress, metadata_episode)
+        hide_image = unwatched and spoiler_settings.get("catalog.hide_unwatched_episode_images", False)
+        hide_overview = unwatched and spoiler_settings.get("catalog.hide_unwatched_episode_overviews", False)
+
+        plot = metadata_episode.get("overview") or metadata_episode.get("plot")
+        if plot and not hide_overview:
+            tag.setPlot(str(plot))
+            tag.setPlotOutline(str(plot))
+
+        episode_poster = (
+            metadata_episode.get("poster_url") or metadata_episode.get("poster")
+            or metadata_episode.get("image") or metadata_episode.get("thumbnail")
+        )
+        episode_backdrop = metadata_episode.get("backdrop_url")
+        episode_still = metadata_episode.get("still_url") or metadata_episode.get("still")
+        if hide_image:
+            if metadata_episode.get("poster_is_episode_still") is not False:
+                episode_poster = series_detail.get("poster_url") or series_detail.get("poster")
+            if metadata_episode.get("backdrop_is_episode_still") is not False:
+                episode_backdrop = series_detail.get("backdrop_url")
+            episode_still = None
+            item.setProperty("Kolo.SpoilerProtected", "true")
+
+        set_art(
+            item, client,
+            poster=episode_poster,
+            backdrop=episode_backdrop,
+            logo=metadata_episode.get("logo_url"),
+            still=episode_still,
+        )
+
+        if detail:
+            set_detail_metadata(item, detail, client)
+        if hide_image:
+            # Detail hydration can reapply the episode still; restore the safe
+            # series artwork (or clear the image when no safe fallback exists).
+            set_art(
+                item, client,
+                poster=episode_poster,
+                backdrop=episode_backdrop,
+                logo=metadata_episode.get("logo_url"),
+                still=None,
+            )
+            if not episode_poster:
+                item.setArt({"poster": "", "thumb": "", "landscape": ""})
+            if not episode_backdrop:
+                item.setArt({"fanart": ""})
+            item.setArt({"still": ""})
+        if hide_overview:
+            tag.setPlot("")
+            tag.setPlotOutline("")
+            item.setProperty("Kolo.SpoilerOverviewHidden", "true")
 
         set_watch_state(item, display_progress, "episode")
         item.setProperty("IsPlayable", "true")
@@ -9342,70 +9452,113 @@ def play(
             library_id,
         )
 
+    # Fetch version markers before entering the playback monitor. The monitor
+    # receives prepared spans rather than reaching back into play()'s local
+    # variables (content_id, file_id, library_id, detail).
+    try:
+        versions = (watch_detail or {}).get("versions") or []
+        selected_version = next(
+            (
+                version for version in versions
+                if str(version.get("file_id") or version.get("id") or "") == str(file_id)
+            ),
+            None,
+        )
+        if selected_version is None:
+            versions = client.versions(content_id, library_id) or []
+            selected_version = next(
+                (
+                    version for version in versions
+                    if str(version.get("id") or version.get("file_id") or "") == str(file_id)
+                ),
+                None,
+            )
+        if selected_version is None and isinstance(detail, dict):
+            selected_version = detail.get("file_version") or detail.get("version") or detail
+
+        if selected_version:
+            resolved_item.setProperty(
+                "Kolo.TrickplayAvailable",
+                "true" if selected_version.get("trickplay_available") is True else "false",
+            )
+            marker_segments = selected_version.get("marker_segments") or []
+            if marker_segments:
+                # Normalize signed image URLs without changing their query strings.
+                for marker in marker_segments:
+                    if isinstance(marker, dict) and marker.get("thumbnail_url"):
+                        marker["thumbnail_url"] = client.abs_url(marker["thumbnail_url"])
+                resolved_item.setProperty(
+                    "Kolo.MarkerSegments",
+                    json.dumps(marker_segments, separators=(",", ":"), ensure_ascii=False),
+                )
+                _set_marker_preview_properties(resolved_item, marker_segments)
+
+            # The manifest is short-lived and contains signed immutable sheet
+            # URLs. Keep it only on the active ListItem; never persist its URLs.
+            playback_features = set((client.playback_caps().get("features") or []))
+            if selected_version.get("trickplay_available") is True and "trickplay_v1" in playback_features:
+                try:
+                    manifest = client.trickplay_manifest(content_id, file_id)
+                    def absolutize_preview_urls(value):
+                        if isinstance(value, dict):
+                            return {
+                                key: (
+                                    client.abs_url(child)
+                                    if (key == "url" or key.endswith("_url")) and isinstance(child, str)
+                                    else absolutize_preview_urls(child)
+                                )
+                                for key, child in value.items()
+                            }
+                        if isinstance(value, list):
+                            return [absolutize_preview_urls(child) for child in value]
+                        return value
+                    manifest = absolutize_preview_urls(manifest)
+                    if manifest:
+                        info["_silo_trickplay_manifest"] = manifest
+                        info["_silo_content_id"] = str(content_id)
+                        info["_silo_file_id"] = str(file_id)
+                        expires_at = manifest.get("expires_at")
+                        try:
+                            info["_silo_trickplay_manifest_expires_at"] = (
+                                float(expires_at) if isinstance(expires_at, (int, float))
+                                else datetime.datetime.fromisoformat(
+                                    str(expires_at).replace("Z", "+00:00")
+                                ).timestamp()
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            info["_silo_trickplay_manifest_expires_at"] = 0.0
+                        resolved_item.setProperty(
+                            "Kolo.TrickplayManifest",
+                            json.dumps(manifest, separators=(",", ":"), ensure_ascii=False),
+                        )
+                        _set_trickplay_preview_properties(resolved_item, manifest)
+                except SiloError as preview_exc:
+                    log("Silo seek-preview manifest unavailable: %s" % preview_exc, xbmc.LOGDEBUG)
+
+            if ADDON.getSettingBool("skip_segments_enabled"):
+                timeline = (info.get("playback_plan") or {}).get("timeline") or {}
+                try:
+                    timeline_offset = float(timeline.get("timeline_offset_seconds") or 0.0)
+                except (TypeError, ValueError):
+                    timeline_offset = 0.0
+                spans = skip_segments(selected_version, offset=timeline_offset)
+                if spans:
+                    info["_silo_skip_spans"] = spans
+                    info["_silo_content_id"] = str(content_id)
+    except Exception as exc:
+        log(
+            "Unable to load Silo playback previews/skip markers for %s: %s"
+            % (content_id, exc),
+            xbmc.LOGDEBUG,
+        )
+
+    # Publish the fully decorated item only after the seek and marker
+    # preview properties have been attached, so Kodi skins can read them.
     xbmcplugin.setResolvedUrl(
         HANDLE,
         True,
         resolved_item,
     )
-
-    # Fetch version markers before entering the playback monitor. The monitor
-    # receives prepared spans rather than reaching back into play()'s local
-    # variables (content_id, file_id, library_id, detail).
-    if ADDON.getSettingBool("skip_segments_enabled"):
-        try:
-            versions = (watch_detail or {}).get("versions") or []
-            selected_version = next(
-                (
-                    version for version in versions
-                    if str(version.get("file_id") or version.get("id") or "") == str(file_id)
-                ),
-                None,
-            )
-            if selected_version is None:
-                versions = client.versions(content_id, library_id) or []
-                selected_version = next(
-                    (
-                        version for version in versions
-                        if str(version.get("id") or version.get("file_id") or "") == str(file_id)
-                    ),
-                    None,
-                )
-            if selected_version is None and isinstance(detail, dict):
-                selected_version = (
-                    detail.get("file_version")
-                    or detail.get("version")
-                    or detail
-                )
-            timeline = (info.get("playback_plan") or {}).get("timeline") or {}
-            try:
-                timeline_offset = float(timeline.get("timeline_offset_seconds") or 0.0)
-            except (TypeError, ValueError):
-                timeline_offset = 0.0
-            spans = skip_segments(selected_version, offset=timeline_offset)
-            if spans:
-                info["_silo_skip_spans"] = spans
-                info["_silo_content_id"] = str(content_id)
-            if selected_version:
-                resolved_item.setProperty(
-                    "Kolo.TrickplayAvailable",
-                    "true" if selected_version.get("trickplay_available") is True else "false",
-                )
-                marker_segments = selected_version.get("marker_segments")
-                if marker_segments:
-                    resolved_item.setProperty(
-                        "Kolo.MarkerSegments",
-                        json.dumps(
-                            marker_segments,
-                            separators=(",", ":"),
-                            ensure_ascii=False,
-                        ),
-                    )
-        except Exception as exc:
-            log(
-                "Unable to load Silo skip markers for %s: %s"
-                % (content_id, exc),
-                xbmc.LOGDEBUG,
-            )
 
     session_id = info.get("session_id")
 
@@ -9504,6 +9657,84 @@ def _kolo_playback_url_key(value):
         return ""
     parsed = urlparse(raw)
     return parsed._replace(query="", fragment="").geturl().rstrip("/")
+
+
+def _playback_control_socket_url(client, session_id):
+    parsed = urlparse(client.base)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return "%s://%s/playback/sessions/%s/control/ws" % (
+        scheme, parsed.netloc, quote(str(session_id), safe="")
+    )
+
+
+def _start_playback_control_socket(client, playback_info, pending_events):
+    """Connect the negotiated native playback control channel, if available."""
+    features = set((playback_info or {}).get("client_features") or [])
+    if not ({"plan_invalidated_v1", "marker_thumbnails_v1"} & features):
+        return None
+    session_id = str((playback_info or {}).get("session_id") or "")
+    if not session_id:
+        return None
+    stop_event = threading.Event()
+    state = {"socket": None}
+
+    def run():
+        ws = None
+        try:
+            ws = _SiloWebSocket(
+                _playback_control_socket_url(client, session_id),
+                timeout=10,
+                origin=_watch_party_http_origin(client),
+                headers=client._headers(send_profile=False),
+            )
+            ws.connect()
+            state["socket"] = ws
+            commands = ["plan_invalidated"] if "plan_invalidated_v1" in features else []
+            ws.send({
+                "type": "hello", "session_id": session_id,
+                "client": {"name": "KOLO", "version": str(ADDON.getAddonInfo("version"))},
+                "capabilities": {"commands": commands},
+            })
+            log("Silo playback control socket connected for session %s." % session_id, xbmc.LOGDEBUG)
+            while not stop_event.is_set():
+                try:
+                    raw = ws.recv()
+                except SiloError:
+                    break
+                if not raw:
+                    continue
+                try:
+                    message = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("type") == "command" and message.get("name") == "plan_invalidated":
+                    command_id = str(message.get("command_id") or "")
+                    if command_id:
+                        ws.send({"type": "ack", "command_id": command_id,
+                                 "session_id": session_id, "status": "accepted"})
+                        pending_events.put(("plan_invalidated", message, ws))
+                elif (
+                    (message.get("name") or message.get("event") or message.get("type"))
+                    == "marker_thumbnail_ready"
+                ):
+                    pending_events.put((
+                        "marker_thumbnail_ready",
+                        message.get("payload") or message.get("data") or message,
+                        ws,
+                    ))
+        except Exception as exc:
+            log("Silo playback control socket unavailable: %s" % exc, xbmc.LOGDEBUG)
+        finally:
+            if ws:
+                ws.close()
+            state["socket"] = None
+
+    thread = threading.Thread(target=run, name="KoloPlaybackControl")
+    thread.daemon = True
+    thread.start()
+    return {"stop": stop_event, "thread": thread, "state": state}
 
 
 def _kolo_is_dolby_vision_original_plan(playback_info):
@@ -9675,6 +9906,13 @@ def track_progress(
     playback_info = dict(playback_info or {})
     playback_info["session_id"] = session_id
 
+    # Establish the control channel immediately after the server returns a
+    # session. Silo may withdraw a plan during Kodi's initial decoder startup.
+    pending_control_events = queue.Queue()
+    playback_control = _start_playback_control_socket(
+        client, playback_info, pending_control_events
+    )
+
     if direct_play_only:
         log("Direct-play-only mode enabled; adaptive quality switching is disabled.")
 
@@ -9690,6 +9928,14 @@ def track_progress(
             startup_failure = "decoder_failure"
             break
         if monitor.abortRequested():
+            if playback_control:
+                playback_control["stop"].set()
+                try:
+                    control_ws = playback_control["state"].get("socket")
+                    if control_ws:
+                        control_ws.close()
+                except Exception:
+                    pass
             return
         xbmc.sleep(500)
 
@@ -9722,6 +9968,14 @@ def track_progress(
             "Kodi playback did not start; Silo playback session will not be tracked.",
             xbmc.LOGWARNING,
         )
+        if playback_control:
+            playback_control["stop"].set()
+            try:
+                control_ws = playback_control["state"].get("socket")
+                if control_ws:
+                    control_ws.close()
+            except Exception:
+                pass
         return
 
     if getattr(player, "playback_error_event", None):
@@ -10002,6 +10256,7 @@ def track_progress(
         target_label,
         expected_source_url=None,
         request_started_at=None,
+        attach_timeout=30.0,
     ):
         """Adopt an Silo replan without visibly jumping back to zero."""
         new_url = new_info.get("url")
@@ -10079,7 +10334,11 @@ def track_progress(
         # measuring the old stream and immediately issue another replan.
         attached = False
         expected_url_key = playback_url_key(new_url)
-        for _ in range(120):
+        try:
+            attach_attempts = max(1, min(120, int(float(attach_timeout or 30.0) * 4)))
+        except (TypeError, ValueError):
+            attach_attempts = 120
+        for _ in range(attach_attempts):
             if monitor.abortRequested():
                 break
 
@@ -10160,6 +10419,9 @@ def track_progress(
     last_paused = None
     progress_report_interval = 5.0
     next_progress_report_at = time.time()
+    next_trickplay_refresh_at = float(
+        playback_info.get("_silo_trickplay_manifest_expires_at") or 0.0
+    )
     next_progress_retry_not_before = 0.0
     progress_confirmed = True
     stall_started_at = None
@@ -10215,6 +10477,181 @@ def track_progress(
             break
 
         now = time.time()
+
+        # Trickplay manifests carry expiring signed sheet URLs. Refresh shortly
+        # before expiry and replace the active ListItem property for skin OSDs.
+        if (
+            resolved_item is not None
+            and playback_info.get("_silo_trickplay_manifest")
+            and next_trickplay_refresh_at
+            and now >= next_trickplay_refresh_at - 30.0
+        ):
+            try:
+                refreshed = client.trickplay_manifest(
+                    playback_info.get("_silo_content_id"),
+                    playback_info.get("_silo_file_id"),
+                )
+                if refreshed:
+                    def refresh_preview_urls(value):
+                        if isinstance(value, dict):
+                            return {
+                                key: (
+                                    client.abs_url(child)
+                                    if (key == "url" or key.endswith("_url")) and isinstance(child, str)
+                                    else refresh_preview_urls(child)
+                                )
+                                for key, child in value.items()
+                            }
+                        if isinstance(value, list):
+                            return [refresh_preview_urls(child) for child in value]
+                        return value
+                    refreshed = refresh_preview_urls(refreshed)
+                    playback_info["_silo_trickplay_manifest"] = refreshed
+                    resolved_item.setProperty(
+                        "Kolo.TrickplayManifest",
+                        json.dumps(refreshed, separators=(",", ":"), ensure_ascii=False),
+                    )
+                    _set_trickplay_preview_properties(resolved_item, refreshed)
+                    expiry = refreshed.get("expires_at")
+                    try:
+                        next_trickplay_refresh_at = (
+                            float(expiry) if isinstance(expiry, (int, float))
+                            else datetime.datetime.fromisoformat(
+                                str(expiry).replace("Z", "+00:00")
+                            ).timestamp()
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        next_trickplay_refresh_at = 0.0
+                else:
+                    next_trickplay_refresh_at = now + 60.0
+            except Exception as preview_exc:
+                log("Unable to refresh Silo seek-preview manifest: %s" % preview_exc, xbmc.LOGDEBUG)
+                next_trickplay_refresh_at = now + 60.0
+
+        # Handle server-pushed plan withdrawals and asynchronously generated
+        # marker thumbnails on the playback thread (Kodi player APIs are not
+        # called from the socket worker).
+        while True:
+            try:
+                event_name, payload, control_ws = pending_control_events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_name == "marker_thumbnail_ready":
+                try:
+                    event_file_id = payload.get("file_id") or ""
+                    if not event_file_id or str(event_file_id) == str(playback_info.get("file_id") or ""):
+                        occurrence = payload.get("occurrence") or payload.get("marker") or payload
+                        occurrence_id = str(
+                            payload.get("occurrence_id")
+                            or occurrence.get("occurrence_id")
+                            or occurrence.get("id")
+                            or ""
+                        )
+                        marker_key = (
+                            str(occurrence.get("kind") or "").lower(),
+                            round(float(occurrence.get("start_seconds", occurrence.get("start", 0)) or 0.0), 3),
+                            round(float(occurrence.get("end_seconds", occurrence.get("end", 0)) or 0.0), 3),
+                        )
+                        thumbnail_url = payload.get("thumbnail_url") or occurrence.get("thumbnail_url")
+                        current = json.loads(resolved_item.getProperty("Kolo.MarkerSegments") or "[]")
+                        for marker in current:
+                            key = (
+                                str(marker.get("kind") or "").lower(),
+                                round(float(marker.get("start_seconds", marker.get("start", 0)) or 0.0), 3),
+                                round(float(marker.get("end_seconds", marker.get("end", 0)) or 0.0), 3),
+                            )
+                            same_id = occurrence_id and occurrence_id in (
+                                str(marker.get("occurrence_id") or ""),
+                                str(marker.get("id") or ""),
+                            )
+                            if same_id or key == marker_key:
+                                if thumbnail_url:
+                                    marker["thumbnail_url"] = client.abs_url(thumbnail_url)
+                                marker["thumbnail_thumbhash"] = (
+                                    payload.get("thumbnail_thumbhash")
+                                    or occurrence.get("thumbnail_thumbhash")
+                                )
+                                marker["thumbnail_capture_seconds"] = (
+                                    payload.get("thumbnail_capture_seconds")
+                                    or occurrence.get("thumbnail_capture_seconds")
+                                )
+                                break
+                        resolved_item.setProperty(
+                            "Kolo.MarkerSegments",
+                            json.dumps(current, separators=(",", ":"), ensure_ascii=False),
+                        )
+                        _set_marker_preview_properties(resolved_item, current)
+                except Exception as exc:
+                    log("Unable to apply Silo marker preview update: %s" % exc, xbmc.LOGDEBUG)
+
+            elif event_name == "plan_invalidated":
+                command_id = str(payload.get("command_id") or "")
+                invalidated_plan_id = str((payload.get("payload") or {}).get("plan_id") or "")
+                active_plan = playback_info.get("playback_plan") or {}
+                active_plan_id = str(active_plan.get("plan_id") or "")
+                command_status = "completed"
+                if invalidated_plan_id and invalidated_plan_id == active_plan_id:
+                    # Stop advancing the withdrawn transport while the server
+                    # chooses its replacement; the same source position is the
+                    # anchor for the recovery plan.
+                    try:
+                        if player.isPlaying() and not xbmc.getCondVisibility("Player.Paused"):
+                            player.pause()
+                    except Exception:
+                        pass
+                    try:
+                        current_position = max(0.0, float(player.getTime()))
+                    except Exception:
+                        current_position = max(0.0, float(last_position or 0.0))
+                    replan_started_at = time.time()
+                    try:
+                        replacement = client.replan_playback(
+                            playback_info,
+                            current_position,
+                            quality_preference="auto",
+                            operation="failure_recovery",
+                            failure={
+                                "classification": "playback_recovery",
+                                "message": "Silo withdrew the active playback plan (%s) and requested a replacement." % str(payload.get("reason") or "unknown")[:160],
+                            },
+                            timeout=4.5,
+                        )
+                        if not switch_stream(
+                            replacement,
+                            current_position,
+                            "auto",
+                            expected_source_url=playback_info.get("url"),
+                            request_started_at=replan_started_at,
+                            attach_timeout=2.0,
+                        ):
+                            command_status = "rejected"
+                        else:
+                            session_id = str(playback_info.get("session_id") or session_id)
+                            last_position = current_position
+                            last_observed_position = None
+                            last_progress_position = None
+                            last_progress_change_at = time.time()
+                            progress_confirmed = False
+                            healthy_since = 0.0
+                            close_stall(time.time())
+                            post_switch_grace_until = time.time() + 15.0
+                    except Exception as exc:
+                        command_status = "rejected"
+                        log("Silo plan invalidation recovery failed: %s" % exc, xbmc.LOGWARNING)
+                if command_status == "rejected" and invalidated_plan_id == active_plan_id:
+                    try:
+                        player.stop()
+                    except Exception:
+                        pass
+                if command_id:
+                    try:
+                        control_ws.send({
+                            "type": "result", "command_id": command_id,
+                            "session_id": session_id, "status": command_status,
+                        })
+                    except Exception as exc:
+                        log("Unable to acknowledge Silo playback plan invalidation: %s" % exc, xbmc.LOGDEBUG)
 
         if (
             getattr(player, "playback_error_event", None)
@@ -11037,7 +11474,7 @@ def track_progress(
                     xbmc.LOGWARNING,
                 )
 
-        for _ in range(50):
+        for _ in range(10 if playback_control else 50):
             if not player.isPlaying() or monitor.abortRequested():
                 break
 
@@ -11104,6 +11541,15 @@ def track_progress(
                 "Unexpected error stopping Silo playback session: %s" % exc,
                 xbmc.LOGWARNING,
             )
+
+    if playback_control:
+        playback_control["stop"].set()
+        try:
+            control_ws = playback_control["state"].get("socket")
+            if control_ws:
+                control_ws.close()
+        except Exception:
+            pass
 
     log(
         "Adaptive playback monitor ended for session %s at quality=%s"
