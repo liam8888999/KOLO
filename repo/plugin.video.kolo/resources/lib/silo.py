@@ -2442,6 +2442,53 @@ class SiloClient:
             ) or {}
 
         return self._caps
+    
+    def trickplay_manifest(self, content_id, file_id):
+        """Read the signed seek-preview manifest for one authorized media file."""
+        if not content_id or not file_id:
+            return {}
+        data = self._json(
+            "GET",
+            "/api/v2/watch/%s/trickplay" % quote(str(content_id), safe=":"),
+            params={"file_id": str(file_id)},
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
+    def episode_spoiler_settings(self):
+        """Resolve the two profile-scoped episode spoiler preferences when supported."""
+        if not hasattr(self, "_episode_spoiler_settings"):
+            self._episode_spoiler_settings = None
+        if self._episode_spoiler_settings is not None:
+            return self._episode_spoiler_settings
+
+        defaults = {
+            "catalog.hide_unwatched_episode_images": False,
+            "catalog.hide_unwatched_episode_overviews": False,
+        }
+        try:
+            capabilities = self._json(
+                "GET",
+                "/api/v2/settings/contract/capabilities",
+                need_profile=False,
+            ) or {}
+            if int(capabilities.get("manifest_revision") or 0) < 17:
+                self._episode_spoiler_settings = defaults
+                return defaults
+            data = self._json(
+                "GET",
+                "/api/v2/settings/values/effective",
+                params={"keys": list(defaults)},
+            ) or {}
+            for entry in data.get("items") or []:
+                if not isinstance(entry, dict) or entry.get("key") not in defaults:
+                    continue
+                defaults[entry["key"]] = bool(entry.get("value"))
+        except (SiloError, TypeError, ValueError) as exc:
+            log("Episode spoiler settings unavailable; leaving episode metadata unchanged: %s" % exc, xbmc.LOGDEBUG)
+        self._episode_spoiler_settings = defaults
+        return defaults
 
     # Identify this Kodi installation in playback requests.
     def _installation_id(self):
@@ -2773,6 +2820,12 @@ class SiloClient:
             hls_delivery["supported_on_device"] = False
 
         client_features = ["playback_plan_v3", "seek_reanchor_v1"]
+        # These negotiated features are only enabled when the server promises
+        # the matching realtime/control behaviour.
+        if "plan_invalidated_v1" in supported_features:
+            client_features.append("plan_invalidated_v1")
+        if "marker_thumbnails_v1" in supported_features:
+            client_features.append("marker_thumbnails_v1")
         # Kodi's native player supports SRT sidecars and can consume the
         # original SubRip file without a server-side WebVTT conversion.
         if "subrip_sidecar_v1" in supported_features:
