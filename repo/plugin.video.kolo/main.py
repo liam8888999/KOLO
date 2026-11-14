@@ -10204,6 +10204,11 @@ def track_progress(
     known_good_quality = playback_info["adaptive_quality"]
     known_good_since = time.time()
 
+    pending_control_events = queue.Queue()
+    playback_control = _start_playback_control_socket(
+        client, playback_info, pending_control_events
+    )
+
     auto_skip = {
         "intro": ADDON.getSettingBool("auto_skip_intro"),
         "recap": ADDON.getSettingBool("auto_skip_recap"),
@@ -10286,6 +10291,95 @@ def track_progress(
             break
 
         now = time.time()
+
+        # Handle server-pushed plan withdrawals and asynchronously generated
+        # marker thumbnails on the playback thread (Kodi player APIs are not
+        # called from the socket worker).
+        while True:
+            try:
+                event_name, payload, control_ws = pending_control_events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_name == "marker_thumbnail_ready":
+                try:
+                    if str(payload.get("file_id") or "") == str(playback_info.get("file_id") or ""):
+                        marker_key = (
+                            str(payload.get("kind") or "").lower(),
+                            round(float(payload.get("start_seconds") or 0.0), 3),
+                            round(float(payload.get("end_seconds") or 0.0), 3),
+                        )
+                        current = json.loads(resolved_item.getProperty("Kolo.MarkerSegments") or "[]")
+                        for marker in current:
+                            key = (
+                                str(marker.get("kind") or "").lower(),
+                                round(float(marker.get("start_seconds", marker.get("start", 0)) or 0.0), 3),
+                                round(float(marker.get("end_seconds", marker.get("end", 0)) or 0.0), 3),
+                            )
+                            if key == marker_key:
+                                marker["thumbnail_url"] = client.abs_url(payload.get("thumbnail_url"))
+                                marker["thumbnail_thumbhash"] = payload.get("thumbnail_thumbhash")
+                                marker["thumbnail_capture_seconds"] = payload.get("thumbnail_capture_seconds")
+                                break
+                        resolved_item.setProperty(
+                            "Kolo.MarkerSegments",
+                            json.dumps(current, separators=(",", ":"), ensure_ascii=False),
+                        )
+                except Exception as exc:
+                    log("Unable to apply Silo marker preview update: %s" % exc, xbmc.LOGDEBUG)
+
+            elif event_name == "plan_invalidated":
+                command_id = str(payload.get("command_id") or "")
+                invalidated_plan_id = str((payload.get("payload") or {}).get("plan_id") or "")
+                active_plan = playback_info.get("playback_plan") or {}
+                active_plan_id = str(active_plan.get("plan_id") or "")
+                command_status = "completed"
+                if invalidated_plan_id and invalidated_plan_id == active_plan_id:
+                    try:
+                        current_position = max(0.0, float(player.getTime()))
+                    except Exception:
+                        current_position = max(0.0, float(last_position or 0.0))
+                    replan_started_at = time.time()
+                    try:
+                        replacement = client.replan_playback(
+                            playback_info,
+                            current_position,
+                            quality_preference="auto",
+                            operation="failure_recovery",
+                            failure={
+                                "classification": str(payload.get("reason") or "plan_invalidated")[:64],
+                                "message": "Silo withdrew the active playback plan and requested a replacement.",
+                            },
+                        )
+                        if not switch_stream(
+                            replacement,
+                            current_position,
+                            "auto",
+                            expected_source_url=playback_info.get("url"),
+                            request_started_at=replan_started_at,
+                        ):
+                            command_status = "rejected"
+                        else:
+                            session_id = str(playback_info.get("session_id") or session_id)
+                            last_position = current_position
+                            last_observed_position = None
+                            last_progress_position = None
+                            last_progress_change_at = time.time()
+                            progress_confirmed = False
+                            healthy_since = 0.0
+                            close_stall(time.time())
+                            post_switch_grace_until = time.time() + 15.0
+                    except Exception as exc:
+                        command_status = "rejected"
+                        log("Silo plan invalidation recovery failed: %s" % exc, xbmc.LOGWARNING)
+                if command_id:
+                    try:
+                        control_ws.send({
+                            "type": "result", "command_id": command_id,
+                            "session_id": session_id, "status": command_status,
+                        })
+                    except Exception as exc:
+                        log("Unable to acknowledge Silo playback plan invalidation: %s" % exc, xbmc.LOGDEBUG)
 
         if (
             getattr(player, "playback_error_event", None)
@@ -11175,6 +11269,15 @@ def track_progress(
                 "Unexpected error stopping Silo playback session: %s" % exc,
                 xbmc.LOGWARNING,
             )
+
+    if playback_control:
+        playback_control["stop"].set()
+        try:
+            control_ws = playback_control["state"].get("socket")
+            if control_ws:
+                control_ws.close()
+        except Exception:
+            pass
 
     log(
         "Adaptive playback monitor ended for session %s at quality=%s"
