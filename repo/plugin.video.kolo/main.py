@@ -4138,6 +4138,7 @@ class _SiloWebSocket:
         self.headers = dict(headers or {})
         self.sock = None
         self._buffer = b""
+        self._send_lock = threading.Lock()
 
     def connect(self):
         parsed = urlparse(self.url)
@@ -4431,7 +4432,10 @@ class _SiloWebSocket:
             for index, value in enumerate(payload)
         )
 
-        self.sock.sendall(header + mask + masked)
+        with self._send_lock:
+            if self.sock is None:
+                raise SiloError("WebSocket is closed.")
+            self.sock.sendall(header + mask + masked)
 
     def close(self):
         sock = self.sock
