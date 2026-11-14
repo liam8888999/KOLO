@@ -9397,61 +9397,87 @@ def play(
     # Fetch version markers before entering the playback monitor. The monitor
     # receives prepared spans rather than reaching back into play()'s local
     # variables (content_id, file_id, library_id, detail).
-    if ADDON.getSettingBool("skip_segments_enabled"):
-        try:
-            versions = (watch_detail or {}).get("versions") or []
+    try:
+        versions = (watch_detail or {}).get("versions") or []
+        selected_version = next(
+            (
+                version for version in versions
+                if str(version.get("file_id") or version.get("id") or "") == str(file_id)
+            ),
+            None,
+        )
+        if selected_version is None:
+            versions = client.versions(content_id, library_id) or []
             selected_version = next(
                 (
                     version for version in versions
-                    if str(version.get("file_id") or version.get("id") or "") == str(file_id)
+                    if str(version.get("id") or version.get("file_id") or "") == str(file_id)
                 ),
                 None,
             )
-            if selected_version is None:
-                versions = client.versions(content_id, library_id) or []
-                selected_version = next(
-                    (
-                        version for version in versions
-                        if str(version.get("id") or version.get("file_id") or "") == str(file_id)
-                    ),
-                    None,
-                )
-            if selected_version is None and isinstance(detail, dict):
-                selected_version = (
-                    detail.get("file_version")
-                    or detail.get("version")
-                    or detail
-                )
-            timeline = (info.get("playback_plan") or {}).get("timeline") or {}
-            try:
-                timeline_offset = float(timeline.get("timeline_offset_seconds") or 0.0)
-            except (TypeError, ValueError):
-                timeline_offset = 0.0
-            spans = skip_segments(selected_version, offset=timeline_offset)
-            if spans:
-                info["_silo_skip_spans"] = spans
-                info["_silo_content_id"] = str(content_id)
-            if selected_version:
-                resolved_item.setProperty(
-                    "Kolo.TrickplayAvailable",
-                    "true" if selected_version.get("trickplay_available") is True else "false",
-                )
-                marker_segments = selected_version.get("marker_segments")
-                if marker_segments:
-                    resolved_item.setProperty(
-                        "Kolo.MarkerSegments",
-                        json.dumps(
-                            marker_segments,
-                            separators=(",", ":"),
-                            ensure_ascii=False,
-                        ),
-                    )
-        except Exception as exc:
-            log(
-                "Unable to load Silo skip markers for %s: %s"
-                % (content_id, exc),
-                xbmc.LOGDEBUG,
+        if selected_version is None and isinstance(detail, dict):
+            selected_version = detail.get("file_version") or detail.get("version") or detail
+
+        if selected_version:
+            resolved_item.setProperty(
+                "Kolo.TrickplayAvailable",
+                "true" if selected_version.get("trickplay_available") is True else "false",
             )
+            marker_segments = selected_version.get("marker_segments") or []
+            if marker_segments:
+                # Normalize signed image URLs without changing their query strings.
+                for marker in marker_segments:
+                    if isinstance(marker, dict) and marker.get("thumbnail_url"):
+                        marker["thumbnail_url"] = client.abs_url(marker["thumbnail_url"])
+                resolved_item.setProperty(
+                    "Kolo.MarkerSegments",
+                    json.dumps(marker_segments, separators=(",", ":"), ensure_ascii=False),
+                )
+
+            # The manifest is short-lived and contains signed immutable sheet
+            # URLs. Keep it only on the active ListItem; never persist its URLs.
+            playback_features = set((client.playback_caps().get("features") or []))
+            if selected_version.get("trickplay_available") is True and "trickplay_v1" in playback_features:
+                try:
+                    manifest = client.trickplay_manifest(content_id, file_id)
+                    def absolutize_preview_urls(value):
+                        if isinstance(value, dict):
+                            return {
+                                key: (
+                                    client.abs_url(child)
+                                    if key.endswith("_url") and isinstance(child, str)
+                                    else absolutize_preview_urls(child)
+                                )
+                                for key, child in value.items()
+                            }
+                        if isinstance(value, list):
+                            return [absolutize_preview_urls(child) for child in value]
+                        return value
+                    manifest = absolutize_preview_urls(manifest)
+                    if manifest:
+                        resolved_item.setProperty(
+                            "Kolo.TrickplayManifest",
+                            json.dumps(manifest, separators=(",", ":"), ensure_ascii=False),
+                        )
+                except SiloError as preview_exc:
+                    log("Silo seek-preview manifest unavailable: %s" % preview_exc, xbmc.LOGDEBUG)
+
+            if ADDON.getSettingBool("skip_segments_enabled"):
+                timeline = (info.get("playback_plan") or {}).get("timeline") or {}
+                try:
+                    timeline_offset = float(timeline.get("timeline_offset_seconds") or 0.0)
+                except (TypeError, ValueError):
+                    timeline_offset = 0.0
+                spans = skip_segments(selected_version, offset=timeline_offset)
+                if spans:
+                    info["_silo_skip_spans"] = spans
+                    info["_silo_content_id"] = str(content_id)
+    except Exception as exc:
+        log(
+            "Unable to load Silo playback previews/skip markers for %s: %s"
+            % (content_id, exc),
+            xbmc.LOGDEBUG,
+        )
 
     session_id = info.get("session_id")
 
