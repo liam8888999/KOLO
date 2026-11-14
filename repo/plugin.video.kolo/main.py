@@ -41,6 +41,7 @@ import os
 import socket
 import ssl
 import struct
+import queue
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import parse_qsl, urlencode, urlparse
@@ -4054,11 +4055,12 @@ def _watch_party_leave():
 class _SiloWebSocket:
     """Minimal RFC 6455 WebSocket client for Silo's room protocol."""
 
-    def __init__(self, url, protocols, timeout=15, origin=None):
+    def __init__(self, url, protocols=None, timeout=15, origin=None, headers=None):
         self.url = url
         self.protocols = list(protocols or [])
         self.timeout = float(timeout or 15)
         self.origin = str(origin or "").strip()
+        self.headers = dict(headers or {})
         self.sock = None
         self._buffer = b""
 
@@ -4222,11 +4224,9 @@ class _SiloWebSocket:
             self.close()
             raise SiloError("Invalid Watch Party WebSocket handshake response.")
 
-        if headers.get("sec-websocket-protocol", "").strip() != "silo.room.v2":
+        if self.protocols and headers.get("sec-websocket-protocol", "").strip() not in self.protocols:
             self.close()
-            raise SiloError(
-                "Silo did not select the expected Watch Party socket protocol."
-            )
+            raise SiloError("Silo did not select the expected WebSocket subprotocol.")
 
         # Keep the room monitor responsive enough to immediately undo
         # unauthorized Kodi pause/seek actions.
