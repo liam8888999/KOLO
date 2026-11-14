@@ -3117,13 +3117,18 @@ def _episode_is_unwatched(progress, catalog_item=None):
         state = catalog_item.get("user_data") or catalog_item.get("user_state") or {}
     if not isinstance(state, dict):
         state = {}
-    if state.get("played") is True or state.get("completed") is True:
+    def enabled(value):
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+    if enabled(state.get("played")) or enabled(state.get("completed")):
         return False
     try:
         position = float(state.get("position_seconds") or 0)
     except (TypeError, ValueError):
         position = 0.0
-    return not bool(state.get("is_in_progress")) and position <= 0.0
+    return not enabled(state.get("is_in_progress")) and position <= 0.0
 
 
 def _episode_spoiler_preferences(client):
