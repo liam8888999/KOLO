@@ -3655,7 +3655,6 @@ _KOLO_PROFILE_SETTING_KEYS = frozenset((
     "playback.auto_play_next",
     "playback.auto_play_next_preview",
     "playback.next_up_prompt_seconds",
-    "player.seek_cache_enabled",
     "catalog.metadata_language",
     "search.media_scope",
     "ui.next_up_mode",
