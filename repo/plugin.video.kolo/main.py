@@ -3076,6 +3076,40 @@ def add_catalog_context_menu(list_item, catalog_item):
     except (AttributeError, RuntimeError, TypeError) as exc:
         log("Unable to attach Silo title actions: %s" % exc, xbmc.LOGDEBUG)
 
+def _set_marker_preview_properties(list_item, marker_segments):
+    """Expose marker ranges as individual skin-readable Kodi properties."""
+    markers = [item for item in (marker_segments or []) if isinstance(item, dict)]
+    list_item.setProperty("Kolo.Marker.Count", str(len(markers)))
+    for index, marker in enumerate(markers):
+        prefix = "Kolo.Marker.%d." % index
+        list_item.setProperty(prefix + "Kind", str(marker.get("kind") or ""))
+        list_item.setProperty(prefix + "Start", str(marker.get("start_seconds", marker.get("start", ""))))
+        list_item.setProperty(prefix + "End", str(marker.get("end_seconds", marker.get("end", ""))))
+        list_item.setProperty(prefix + "Thumbnail", str(marker.get("thumbnail_url") or ""))
+
+
+def _set_trickplay_preview_properties(list_item, manifest):
+    """Expose seek-sheet geometry and URLs as simple skin InfoLabels."""
+    manifest = manifest if isinstance(manifest, dict) else {}
+    for field, suffix in (
+        ("interval_ms", "IntervalMs"),
+        ("thumbnail_width", "ThumbnailWidth"),
+        ("thumbnail_height", "ThumbnailHeight"),
+        ("tile_columns", "TileColumns"),
+        ("tile_rows", "TileRows"),
+        ("thumbnail_count", "ThumbnailCount"),
+        ("expires_at", "ExpiresAt"),
+    ):
+        if manifest.get(field) is not None:
+            list_item.setProperty("Kolo.Trickplay." + suffix, str(manifest[field]))
+    sheets = manifest.get("sheets") or []
+    list_item.setProperty("Kolo.Trickplay.SheetCount", str(len(sheets)))
+    for index, sheet in enumerate(sheets):
+        url = sheet.get("url") if isinstance(sheet, dict) else sheet
+        if url:
+            list_item.setProperty("Kolo.Trickplay.Sheet.%d" % index, str(url))
+
+
 def _episode_is_unwatched(progress, catalog_item=None):
     """Apply Silo's definition: not played and no active/positive progress."""
     state = progress if isinstance(progress, dict) else {}
@@ -9450,6 +9484,7 @@ def play(
                     "Kolo.MarkerSegments",
                     json.dumps(marker_segments, separators=(",", ":"), ensure_ascii=False),
                 )
+                _set_marker_preview_properties(resolved_item, marker_segments)
 
             # The manifest is short-lived and contains signed immutable sheet
             # URLs. Keep it only on the active ListItem; never persist its URLs.
@@ -9489,6 +9524,7 @@ def play(
                             "Kolo.TrickplayManifest",
                             json.dumps(manifest, separators=(",", ":"), ensure_ascii=False),
                         )
+                        _set_trickplay_preview_properties(resolved_item, manifest)
                 except SiloError as preview_exc:
                     log("Silo seek-preview manifest unavailable: %s" % preview_exc, xbmc.LOGDEBUG)
 
@@ -10445,6 +10481,7 @@ def track_progress(
                         "Kolo.TrickplayManifest",
                         json.dumps(refreshed, separators=(",", ":"), ensure_ascii=False),
                     )
+                    _set_trickplay_preview_properties(resolved_item, refreshed)
                     expiry = refreshed.get("expires_at")
                     try:
                         next_trickplay_refresh_at = (
@@ -10494,6 +10531,7 @@ def track_progress(
                             "Kolo.MarkerSegments",
                             json.dumps(current, separators=(",", ":"), ensure_ascii=False),
                         )
+                        _set_marker_preview_properties(resolved_item, current)
                 except Exception as exc:
                     log("Unable to apply Silo marker preview update: %s" % exc, xbmc.LOGDEBUG)
 
