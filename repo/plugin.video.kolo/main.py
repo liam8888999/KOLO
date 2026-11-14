@@ -4213,22 +4213,19 @@ class _SiloWebSocket:
 
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (
-            "GET %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Origin: %s\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Key: %s\r\n"
-            "Sec-WebSocket-Version: 13\r\n"
-            "Sec-WebSocket-Protocol: %s\r\n"
-            "\r\n"
-        ) % (
-            path,
-            host_header,
-            self.origin,
-            key,
-            ", ".join(self.protocols),
-        )
+            "GET %s HTTP/1.1\\r\\n"
+            "Host: %s\\r\\n"
+            "Origin: %s\\r\\n"
+            "Upgrade: websocket\\r\\n"
+            "Connection: Upgrade\\r\\n"
+            "Sec-WebSocket-Key: %s\\r\\n"
+            "Sec-WebSocket-Version: 13\\r\\n"
+        ) % (path, host_header, self.origin, key)
+        for header_name, header_value in self.headers.items():
+            request += "%s: %s\\r\\n" % (header_name, header_value)
+        if self.protocols:
+            request += "Sec-WebSocket-Protocol: %s\\r\\n" % ", ".join(self.protocols)
+        request += "\\r\\n"
 
         try:
             self.sock.sendall(request.encode("ascii"))
