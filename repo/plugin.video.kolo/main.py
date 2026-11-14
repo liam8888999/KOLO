@@ -3837,18 +3837,112 @@ def list_admin_server_settings(client):
         xbmcgui.Dialog().ok("Unable to save global setting", str(exc))
 
 
+
+def list_server_plugin_settings(client):
+    try:
+        installations = client.list_plugin_settings()
+    except Exception as exc:
+        xbmcgui.Dialog().ok("Plugin Settings", str(exc))
+        return
+    if not installations:
+        xbmcgui.Dialog().ok("Plugin Settings", "No installed Silo plugins expose user settings.")
+        return
+    labels = []
+    for item in installations:
+        title = item.get("name") or item.get("display_name") or item.get("plugin_id") or item.get("id")
+        labels.append(str(title))
+    selected = xbmcgui.Dialog().select("Installed Plugin Settings", labels)
+    if selected < 0:
+        return
+    installation = installations[selected]
+    installation_id = installation.get("id") or installation.get("installation_id")
+    try:
+        document = client.get_plugin_settings(installation_id)
+        installation = document.get("installation") or installation
+        values = document.get("values") or {}
+    except Exception as exc:
+        xbmcgui.Dialog().ok("Plugin Settings", str(exc))
+        return
+
+    schema_entries = installation.get("user_config_schema") or []
+    if not schema_entries:
+        xbmcgui.Dialog().ok("Plugin Settings", "This plugin has no user-editable settings.")
+        return
+    edited = dict(values)
+    for entry in schema_entries:
+        if not isinstance(entry, dict) or not entry.get("key"):
+            continue
+        key = str(entry["key"])
+        title = str(entry.get("title") or key)
+        description = str(entry.get("description") or "")
+        try:
+            schema = json.loads(entry.get("json_schema") or "{}")
+        except (TypeError, ValueError):
+            schema = {}
+        kind = schema.get("type") or "string"
+        current = edited.get(key, schema.get("default", ""))
+        if isinstance(current, bool):
+            current_text = "true" if current else "false"
+        elif isinstance(current, (dict, list)):
+            current_text = json.dumps(current, ensure_ascii=False)
+        else:
+            current_text = str(current)
+        if description:
+            xbmcgui.Dialog().ok(title, description)
+        enum = schema.get("enum")
+        if enum:
+            choices = [str(value) for value in enum]
+            try:
+                preselect = choices.index(current_text)
+            except ValueError:
+                preselect = 0
+            choice = xbmcgui.Dialog().select(title, choices, preselect=preselect)
+            if choice < 0:
+                return
+            edited[key] = choices[choice]
+        elif kind == "boolean":
+            choice = xbmcgui.Dialog().select(title, ["On", "Off"], preselect=0 if current_text.lower() == "true" else 1)
+            if choice < 0:
+                return
+            edited[key] = "true" if choice == 0 else "false"
+        else:
+            input_type = xbmcgui.INPUT_NUMERIC if kind in ("integer", "number") else xbmcgui.INPUT_ALPHANUM
+            value = xbmcgui.Dialog().input(title, defaultt=current_text, type=input_type)
+            if value == "" and entry.get("required"):
+                notify("%s is required" % title)
+                return
+            if value == "" and key in edited:
+                edited.pop(key, None)
+            elif value != "":
+                edited[key] = value
+    if edited == values:
+        notify("No plugin settings changed")
+        return
+    if not xbmcgui.Dialog().yesno("Save Plugin Settings", "Save the updated settings for this plugin?"):
+        return
+    try:
+        client.update_plugin_settings(installation_id, edited)
+        notify("Plugin settings saved")
+        xbmc.executebuiltin("Container.Refresh")
+    except Exception as exc:
+        log("Unable to save plugin settings: %s" % exc, xbmc.LOGWARNING)
+        xbmcgui.Dialog().ok("Plugin Settings", str(exc))
+
+
 def list_server_settings_menu(client):
     index = xbmcgui.Dialog().select(
         "Silo Server Settings",
-        ["User / Profile Settings", "Global User Defaults (Administrator)", "Global Server Configuration (Administrator)", "KOLO Add-on Settings"],
+        ["User / Profile Settings", "Installed Plugin Settings", "Global User Defaults (Administrator)", "Global Server Configuration (Administrator)", "KOLO Add-on Settings"],
     )
     if index == 0:
         list_server_settings(client)
     elif index == 1:
-        list_admin_user_defaults(client)
+        list_server_plugin_settings(client)
     elif index == 2:
-        list_admin_server_settings(client)
+        list_admin_user_defaults(client)
     elif index == 3:
+        list_admin_server_settings(client)
+    elif index == 4:
         open_settings(client)
 
 
