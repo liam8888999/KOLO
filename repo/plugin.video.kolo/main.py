@@ -10255,6 +10255,7 @@ def track_progress(
         target_label,
         expected_source_url=None,
         request_started_at=None,
+        attach_timeout=30.0,
     ):
         """Adopt an Silo replan without visibly jumping back to zero."""
         new_url = new_info.get("url")
@@ -10332,7 +10333,11 @@ def track_progress(
         # measuring the old stream and immediately issue another replan.
         attached = False
         expected_url_key = playback_url_key(new_url)
-        for _ in range(120):
+        try:
+            attach_attempts = max(1, min(120, int(float(attach_timeout or 30.0) * 4)))
+        except (TypeError, ValueError):
+            attach_attempts = 120
+        for _ in range(attach_attempts):
             if monitor.abortRequested():
                 break
 
@@ -10609,6 +10614,7 @@ def track_progress(
                                 "classification": "playback_recovery",
                                 "message": "Silo withdrew the active playback plan (%s) and requested a replacement." % str(payload.get("reason") or "unknown")[:160],
                             },
+                            timeout=4.5,
                         )
                         if not switch_stream(
                             replacement,
@@ -10616,6 +10622,7 @@ def track_progress(
                             "auto",
                             expected_source_url=playback_info.get("url"),
                             request_started_at=replan_started_at,
+                            attach_timeout=1.0,
                         ):
                             command_status = "rejected"
                         else:
@@ -11466,7 +11473,7 @@ def track_progress(
                     xbmc.LOGWARNING,
                 )
 
-        for _ in range(50):
+        for _ in range(10 if playback_control else 50):
             if not player.isPlaying() or monitor.abortRequested():
                 break
 
