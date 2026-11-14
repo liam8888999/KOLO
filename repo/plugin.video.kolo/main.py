@@ -9506,6 +9506,77 @@ def _kolo_playback_url_key(value):
     return parsed._replace(query="", fragment="").geturl().rstrip("/")
 
 
+def _playback_control_socket_url(client, session_id):
+    parsed = urlparse(client.base)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return "%s://%s/playback/sessions/%s/control/ws" % (
+        scheme, parsed.netloc, quote(str(session_id), safe="")
+    )
+
+
+def _start_playback_control_socket(client, playback_info, pending_events):
+    """Connect the negotiated native playback control channel, if available."""
+    features = set((playback_info or {}).get("client_features") or [])
+    if not ({"plan_invalidated_v1", "marker_thumbnails_v1"} & features):
+        return None
+    session_id = str((playback_info or {}).get("session_id") or "")
+    if not session_id:
+        return None
+    stop_event = threading.Event()
+    state = {"socket": None}
+
+    def run():
+        ws = None
+        try:
+            ws = _SiloWebSocket(
+                _playback_control_socket_url(client, session_id),
+                timeout=10,
+                origin=_watch_party_http_origin(client),
+                headers=client._headers(send_profile=False),
+            )
+            ws.connect()
+            state["socket"] = ws
+            commands = ["plan_invalidated"] if "plan_invalidated_v1" in features else []
+            ws.send({
+                "type": "hello", "session_id": session_id,
+                "client": {"name": "KOLO", "version": str(ADDON.getAddonInfo("version"))},
+                "capabilities": {"commands": commands},
+            })
+            log("Silo playback control socket connected for session %s." % session_id, xbmc.LOGDEBUG)
+            while not stop_event.is_set():
+                try:
+                    raw = ws.recv()
+                except SiloError:
+                    break
+                if not raw:
+                    continue
+                try:
+                    message = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("type") == "command" and message.get("name") == "plan_invalidated":
+                    command_id = str(message.get("command_id") or "")
+                    if command_id:
+                        ws.send({"type": "ack", "command_id": command_id,
+                                 "session_id": session_id, "status": "accepted"})
+                        pending_events.put(("plan_invalidated", message, ws))
+                elif message.get("type") == "event" and message.get("name") == "marker_thumbnail_ready":
+                    pending_events.put(("marker_thumbnail_ready", message.get("payload") or message, ws))
+        except Exception as exc:
+            log("Silo playback control socket unavailable: %s" % exc, xbmc.LOGDEBUG)
+        finally:
+            if ws:
+                ws.close()
+            state["socket"] = None
+
+    thread = threading.Thread(target=run, name="KoloPlaybackControl")
+    thread.daemon = True
+    thread.start()
+    return {"stop": stop_event, "thread": thread, "state": state}
+
+
 def _kolo_is_dolby_vision_original_plan(playback_info):
     """True when Silo's active plan is delivering an original Dolby Vision source."""
     plan = (playback_info or {}).get("playback_plan") or {}
