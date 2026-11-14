@@ -3585,7 +3585,8 @@ def _server_setting_prompt(definition, current):
             return False, None
         return True, value
     if kind in ("object", "array"):
-        answer = xbmcgui.Dialog().input(title, defaultt=json.dumps(current, ensure_ascii=False, sort_keys=True))
+        default_value = json.dumps(current if current is not None else ({} if kind == "object" else []), ensure_ascii=False, sort_keys=True)
+        answer = xbmcgui.Dialog().input(title, defaultt=default_value)
         if answer == "":
             return False, None
         try:
@@ -3824,8 +3825,16 @@ def list_admin_server_settings(client):
     if index < 0:
         return
     key, current = entries[index]
-    value = xbmcgui.Dialog().input(key, defaultt=str(current))
-    if value == "" or not xbmcgui.Dialog().yesno("Save global setting", "Change %s to %s?" % (key, value)):
+    action = xbmcgui.Dialog().select(key, ["Change value", "Clear / restore server default"])
+    if action < 0:
+        return
+    if action == 1:
+        value = ""
+    else:
+        value = xbmcgui.Dialog().input(key, defaultt=str(current))
+        if value == "":
+            return
+    if not xbmcgui.Dialog().yesno("Save global setting", "Change %s to %s?" % (key, value if value else "(empty / default)")):
         return
     try:
         client.update_admin_setting(key, value, validator)
