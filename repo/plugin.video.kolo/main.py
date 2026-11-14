@@ -9634,8 +9634,15 @@ def _start_playback_control_socket(client, playback_info, pending_events):
                         ws.send({"type": "ack", "command_id": command_id,
                                  "session_id": session_id, "status": "accepted"})
                         pending_events.put(("plan_invalidated", message, ws))
-                elif message.get("type") == "event" and message.get("name") == "marker_thumbnail_ready":
-                    pending_events.put(("marker_thumbnail_ready", message.get("payload") or message, ws))
+                elif (
+                    message.get("type") == "event"
+                    and (message.get("name") or message.get("event")) == "marker_thumbnail_ready"
+                ):
+                    pending_events.put((
+                        "marker_thumbnail_ready",
+                        message.get("payload") or message.get("data") or message,
+                        ws,
+                    ))
         except Exception as exc:
             log("Silo playback control socket unavailable: %s" % exc, xbmc.LOGDEBUG)
         finally:
