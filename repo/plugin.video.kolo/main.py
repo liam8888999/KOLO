@@ -3145,13 +3145,21 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
         discart=catalog_item.get("disc_url") or catalog_item.get("discart_url") or catalog_item.get("discart") or (detail or {}).get("disc_url") or (detail or {}).get("discart_url") or (detail or {}).get("discart"),
         landscape=catalog_item.get("landscape_url") or catalog_item.get("landscape") or (detail or {}).get("landscape_url") or (detail or {}).get("landscape") or (detail or {}).get("thumb_url"),
     )
+    if detail:
+        set_detail_metadata(item, detail, client)
+
+    if hide_episode_image:
+        # Detail hydration runs after card construction and may reapply the
+        # still. Clear only artwork whose provenance is unknown/episode-specific.
+        if poster is None:
+            item.setArt({"poster": "", "thumb": "", "landscape": ""})
+        if backdrop is None:
+            item.setArt({"fanart": ""})
+        item.setArt({"still": ""})
     if hide_episode_overview:
         item.getVideoInfoTag().setPlot("")
         item.getVideoInfoTag().setPlotOutline("")
         item.setProperty("Kolo.SpoilerOverviewHidden", "true")
-
-    if detail:
-        set_detail_metadata(item, detail, client)
 
     display_progress = progress if progress is not None else catalog_progress(catalog_item)
     set_watch_state(item, display_progress, media_type)
@@ -8244,6 +8252,21 @@ def list_episodes(client, series_id, season_number, library_id, page=None):
 
         if detail:
             set_detail_metadata(item, detail, client)
+        if hide_image:
+            # Detail hydration can reapply the episode still; restore the safe
+            # series artwork (or clear the image when no safe fallback exists).
+            set_art(
+                item, client,
+                poster=episode_poster,
+                backdrop=episode_backdrop,
+                logo=metadata_episode.get("logo_url"),
+                still=None,
+            )
+            if not episode_poster:
+                item.setArt({"poster": "", "thumb": "", "landscape": ""})
+            if not episode_backdrop:
+                item.setArt({"fanart": ""})
+            item.setArt({"still": ""})
         if hide_overview:
             tag.setPlot("")
             tag.setPlotOutline("")
