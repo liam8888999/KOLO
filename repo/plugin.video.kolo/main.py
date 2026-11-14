@@ -10524,8 +10524,8 @@ def track_progress(
                             quality_preference="auto",
                             operation="failure_recovery",
                             failure={
-                                "classification": str(payload.get("reason") or "plan_invalidated")[:64],
-                                "message": "Silo withdrew the active playback plan and requested a replacement.",
+                                "classification": "playback_recovery",
+                                "message": "Silo withdrew the active playback plan (%s) and requested a replacement." % str(payload.get("reason") or "unknown")[:160],
                             },
                         )
                         if not switch_stream(
