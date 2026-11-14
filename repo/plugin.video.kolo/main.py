@@ -3636,6 +3636,121 @@ def _server_setting_identity(client, scope):
     return identity
 
 
+# Only expose Silo settings that have a meaningful effect in KOLO.
+# The server publishes a much broader cross-platform contract; mobile- and
+# web-only controls, internal UI state, and unrelated preferences stay hidden.
+_KOLO_PROFILE_SETTING_KEYS = frozenset((
+    "playback.buffering_quality_mode",
+    "playback.audio_language",
+    "playback.subtitle_language",
+    "playback.subtitle_mode",
+    "playback.show_forced_subtitles",
+    "playback.preferred_quality",
+    "playback.max_bitrate_kbps",
+    "playback.intro_skip_mode",
+    "playback.show_marker_confidence",
+    "playback.show_marker_source",
+    "playback.auto_skip_credits",
+    "playback.auto_skip_recap",
+    "playback.auto_play_next",
+    "playback.auto_play_next_preview",
+    "playback.next_up_prompt_seconds",
+    "player.seek_cache_enabled",
+    "catalog.metadata_language",
+    "search.media_scope",
+    "ui.next_up_mode",
+    "ui.next_up_new_releases_first",
+    "requests.watchlist_auto_request",
+    "watch_party.guest_control_policy",
+))
+
+_KOLO_ADMIN_DEFAULT_KEYS = frozenset((
+    "ui.next_up_mode",
+    "ui.next_up_new_releases_first",
+))
+
+# These are the server-wide operational settings with a direct impact on
+# playback, markers, metadata, or catalog behaviour exposed by KOLO.
+# All other server configuration remains available in the Silo admin UI.
+_KOLO_ADMIN_SERVER_SETTINGS = {
+    "markers.mode": (
+        "Skip marker detection",
+        "Choose which kinds of skip markers Silo detects and maintains.",
+    ),
+    "markers.lazy_playback": (
+        "Generate markers during playback",
+        "Allow marker generation to run when media is played.",
+    ),
+    "markers.detect_intros": (
+        "Detect episode intros",
+        "Enable automatic detection of episode intro markers.",
+    ),
+    "markers.detect_credits": (
+        "Detect end credits",
+        "Enable automatic detection of end-credit markers.",
+    ),
+    "markers.share_by_default": (
+        "Share detected markers by default",
+        "Whether newly detected markers are shared with other users by default.",
+    ),
+    "playback.preview_image_width": (
+        "Preview image width",
+        "Width, in pixels, used for chapter and seek-preview images.",
+    ),
+    "playback.trickplay_interval_seconds": (
+        "Trickplay thumbnail interval",
+        "How many seconds of video each seek-preview thumbnail represents.",
+    ),
+    "playback.transcode_enabled": (
+        "Allow transcoding",
+        "Allow Silo to transcode media when direct playback is not suitable.",
+    ),
+    "playback.hw_accel": (
+        "Hardware acceleration",
+        "Hardware acceleration mode used for video transcoding.",
+    ),
+    "playback.watched_threshold": (
+        "Watched completion threshold",
+        "Percentage of a video that must be played before it is marked watched.",
+    ),
+    "playback.min_resume_threshold": (
+        "Minimum resume position",
+        "Minimum progress, in percent, before Silo saves a resume position.",
+    ),
+    "metadata.fallback_language": (
+        "Fallback metadata language",
+        "Language used when metadata is unavailable in the preferred language.",
+    ),
+    "metadata.cache_images": (
+        "Cache artwork images",
+        "Allow Silo to keep locally cached copies of downloaded artwork.",
+    ),
+    "catalog.scope_versions_to_library": (
+        "Limit versions to the selected library",
+        "Only show media versions associated with the library being browsed.",
+    ),
+}
+
+_KOLO_SETTING_CATEGORIES = {
+    "playback": "Playback",
+    "player": "Playback controls",
+    "catalog": "Library and metadata",
+    "search": "Search",
+    "navigation": "Home and navigation",
+    "requests": "Requests",
+    "watch_party": "Watch Party",
+}
+
+
+def _kolo_setting_label(definition):
+    key = str(definition.get("key") or "")
+    return str(definition.get("label") or key.replace(".", " ").replace("_", " ").title())
+
+
+def _kolo_setting_description(definition):
+    return str(definition.get("description") or "").strip()
+
+
 def list_server_settings(client):
     try:
         manifest, capabilities = client.settings_contract()
@@ -3644,12 +3759,17 @@ def list_server_settings(client):
         revision = int(capabilities.get("manifest_revision") or 0)
         definitions = [
             d for d in (manifest.get("definitions") or [])
-            if isinstance(d, dict) and d.get("persistence") == "remote"
+            if isinstance(d, dict)
+            and d.get("key") in _KOLO_PROFILE_SETTING_KEYS
+            and d.get("persistence") == "remote"
             and not d.get("deprecated")
             and int(d.get("introduced_in") or 1) <= revision
             and _server_setting_scopes(d, revision)
         ]
         keys = [d.get("key") for d in definitions if d.get("key")]
+        if not definitions:
+            notify("No KOLO-compatible server settings are available")
+            return
         effective = client.effective_setting_values(keys)
     except Exception as exc:
         log("Unable to load Silo server settings: %s" % exc, xbmc.LOGWARNING)
@@ -3658,26 +3778,45 @@ def list_server_settings(client):
 
     categories = {}
     for definition in definitions:
-        category = str(definition.get("category") or "other").replace("_", " ").title()
+        category_key = str(definition.get("category") or "other")
+        category = _KOLO_SETTING_CATEGORIES.get(
+            category_key,
+            category_key.replace("_", " ").title(),
+        )
         categories.setdefault(category, []).append(definition)
     category_names = sorted(categories)
     category_index = xbmcgui.Dialog().select("User / Profile Settings", category_names)
     if category_index < 0:
         return
-    entries = sorted(categories[category_names[category_index]], key=lambda d: str(d.get("label") or d.get("key") or "").lower())
+    entries = sorted(
+        categories[category_names[category_index]],
+        key=lambda d: _kolo_setting_label(d).lower(),
+    )
     labels = []
-    for d in entries:
-        row = effective.get(d.get("key"), {})
-        value = row.get("value", d.get("default_value"))
+    for definition in entries:
+        row = effective.get(definition.get("key"), {})
+        value = row.get("value", definition.get("default_value"))
         shown = json.dumps(value, ensure_ascii=False, sort_keys=True)
         if len(shown) > 42:
             shown = shown[:39] + "..."
-        labels.append("%s: %s [%s]" % (d.get("label") or d.get("key"), shown, row.get("source") or "default"))
+        labels.append(
+            "%s: %s [%s]"
+            % (
+                _kolo_setting_label(definition),
+                shown,
+                row.get("source") or "default",
+            )
+        )
     setting_index = xbmcgui.Dialog().select(category_names[category_index], labels)
     if setting_index < 0:
         return
 
     definition = entries[setting_index]
+    title = _kolo_setting_label(definition)
+    description = _kolo_setting_description(definition)
+    if description:
+        xbmcgui.Dialog().ok(title, description)
+
     key = str(definition.get("key") or "")
     scopes = _server_setting_scopes(definition, revision)
     scope_labels = {
@@ -3688,7 +3827,10 @@ def list_server_settings(client):
         "profile_library": "Specific library",
         "profile_series": "Specific series",
     }
-    scope_index = xbmcgui.Dialog().select("Apply setting to", [scope_labels.get(x, x) for x in scopes])
+    scope_index = xbmcgui.Dialog().select(
+        "Apply '%s' to" % title,
+        [scope_labels.get(x, x) for x in scopes],
+    )
     if scope_index < 0:
         return
     scope = scopes[scope_index]
@@ -3705,19 +3847,22 @@ def list_server_settings(client):
                 library_ids=[identity["library_id"]] if identity.get("library_id") else None,
                 series_ids=[identity["series_id"]] if identity.get("series_id") else None,
             )
-            current = contextual.get(key, effective.get(key, {})).get("value", definition.get("default_value"))
+            current = contextual.get(key, effective.get(key, {})).get(
+                "value",
+                definition.get("default_value"),
+            )
     except Exception as exc:
         log("Unable to read setting override %s: %s" % (key, exc), xbmc.LOGWARNING)
         explicit = {}
         current = effective.get(key, {}).get("value", definition.get("default_value"))
 
     actions = ["Change value"] + (["Reset this override"] if key in explicit else [])
-    action = xbmcgui.Dialog().select(str(definition.get("label") or key), actions)
+    action = xbmcgui.Dialog().select(title, actions)
     if action < 0:
         return
     try:
         if action == 1:
-            if not xbmcgui.Dialog().yesno("Reset setting", "Remove this explicit override?"):
+            if not xbmcgui.Dialog().yesno("Reset setting", "Remove this explicit override for '%s'?" % title):
                 return
             client.delete_setting_value(scope, key, identity=identity)
             notify("Setting reset")
@@ -3740,47 +3885,59 @@ def list_admin_user_defaults(client):
         revision = int(capabilities.get("manifest_revision") or 0)
         definitions = [
             d for d in (manifest.get("definitions") or [])
-            if isinstance(d, dict) and d.get("persistence") == "remote"
-            and d.get("admin_default") and not d.get("deprecated")
+            if isinstance(d, dict)
+            and d.get("key") in _KOLO_ADMIN_DEFAULT_KEYS
+            and d.get("persistence") == "remote"
+            and d.get("admin_default")
+            and not d.get("deprecated")
             and int(d.get("introduced_in") or 1) <= revision
         ]
     except Exception as exc:
         xbmcgui.Dialog().ok("Global User Defaults", str(exc))
         return
     if not definitions:
-        xbmcgui.Dialog().ok("Global User Defaults", "No administrator-managed user defaults are available.")
+        xbmcgui.Dialog().ok(
+            "Global User Defaults",
+            "No KOLO-relevant global user defaults are available.",
+        )
         return
+    definitions.sort(key=lambda d: _kolo_setting_label(d).lower())
     labels = []
-    for d in definitions:
-        raw = values.get("defaults." + str(d.get("key") or ""))
+    for definition in definitions:
+        key = "defaults." + str(definition.get("key") or "")
+        raw = values.get(key)
         try:
-            shown = json.dumps(json.loads(raw), ensure_ascii=False) if raw not in (None, "") else "Contract default"
+            shown = json.dumps(json.loads(raw), ensure_ascii=False) if raw not in (None, "") else "Use Silo's default"
         except (TypeError, ValueError):
             shown = str(raw)
-        labels.append("%s: %s" % (d.get("label") or d.get("key"), shown))
+        labels.append("%s: %s" % (_kolo_setting_label(definition), shown))
     index = xbmcgui.Dialog().select("Global User Defaults", labels)
     if index < 0:
         return
     definition = definitions[index]
+    title = _kolo_setting_label(definition)
+    description = _kolo_setting_description(definition)
+    if description:
+        xbmcgui.Dialog().ok(title, description)
     key = "defaults." + str(definition.get("key") or "")
     raw = values.get(key)
     try:
         current = json.loads(raw) if raw not in (None, "") else definition.get("default_value")
     except (TypeError, ValueError):
         current = raw
-    actions = ["Change global default"] + (["Restore contract default"] if raw not in (None, "") else [])
-    action = xbmcgui.Dialog().select(str(definition.get("label") or key), actions)
+    actions = ["Change global default"] + (["Restore Silo default"] if raw not in (None, "") else [])
+    action = xbmcgui.Dialog().select(title, actions)
     if action < 0:
         return
     if action == 1:
         value = ""
-        confirmation = "Remove the server-wide default override?"
+        confirmation = "Remove the server-wide default override for '%s'?" % title
     else:
         changed, value = _server_setting_prompt(definition, current)
         if not changed or value is None:
             return
         value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        confirmation = "Use this as the default for profiles without an explicit value?"
+        confirmation = "Use this as the default for profiles without their own '%s' setting?" % title
     if not xbmcgui.Dialog().yesno("Save global default", confirmation):
         return
     try:
@@ -3804,48 +3961,63 @@ def list_admin_server_settings(client):
     prefixes = tuple(restart.get("prefixes") or [])
     entries = []
     for key, value in values.items():
-        if str(key).startswith("defaults.") or key in managed or key in secrets:
+        key = str(key)
+        if key not in _KOLO_ADMIN_SERVER_SETTINGS:
+            continue
+        if key in managed or key in secrets:
             continue
         if not isinstance(value, (str, int, float, bool)):
             continue
-        if str(key).endswith(("_secret", ".api_key", ".token", ".password")):
-            continue
-        entries.append((str(key), value))
-    entries.sort(key=lambda x: x[0])
+        entries.append((key, value))
+    entries.sort(key=lambda x: _KOLO_ADMIN_SERVER_SETTINGS[x[0]][0].lower())
     if not entries:
-        xbmcgui.Dialog().ok("Global Server Settings", "No editable global settings were returned.")
+        xbmcgui.Dialog().ok(
+            "Global Server Settings",
+            "No KOLO-relevant editable server settings were returned.",
+        )
         return
     labels = []
     for key, value in entries:
+        title = _KOLO_ADMIN_SERVER_SETTINGS[key][0]
         shown = str(value)
         if len(shown) > 45:
             shown = shown[:42] + "..."
         restart_needed = key in restart_keys or any(key.startswith(p) for p in prefixes)
-        labels.append("%s: %s%s" % (key, shown, " (restart)" if restart_needed else ""))
+        labels.append("%s: %s%s" % (title, shown, " (restart)" if restart_needed else ""))
     index = xbmcgui.Dialog().select("Global Server Settings", labels)
     if index < 0:
         return
     key, current = entries[index]
-    action = xbmcgui.Dialog().select(key, ["Change value", "Clear / restore server default"])
+    title, description = _KOLO_ADMIN_SERVER_SETTINGS[key]
+    xbmcgui.Dialog().ok(title, description)
+    action = xbmcgui.Dialog().select(
+        title,
+        ["Change value", "Clear / restore server default"],
+    )
     if action < 0:
         return
     if action == 1:
         value = ""
     else:
-        value = xbmcgui.Dialog().input(key, defaultt=str(current))
+        value = xbmcgui.Dialog().input(title, defaultt=str(current))
         if value == "":
             return
-    if not xbmcgui.Dialog().yesno("Save global setting", "Change %s to %s?" % (key, value if value else "(empty / default)")):
+    if not xbmcgui.Dialog().yesno(
+        "Save global setting",
+        "Change '%s' to %s?" % (title, value if value else "(empty / default)"),
+    ):
         return
     try:
         client.update_admin_setting(key, value, validator)
         notify("Global setting saved")
         if key in restart_keys or any(key.startswith(p) for p in prefixes):
-            xbmcgui.Dialog().ok("Restart required", "Restart the Silo server for this setting to take effect.")
+            xbmcgui.Dialog().ok(
+                "Restart required",
+                "Restart the Silo server for '%s' to take effect." % title,
+            )
     except Exception as exc:
         log("Unable to update global setting %s: %s" % (key, exc), xbmc.LOGWARNING)
         xbmcgui.Dialog().ok("Unable to save global setting", str(exc))
-
 
 
 def list_server_plugin_settings(client):
