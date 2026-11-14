@@ -9388,12 +9388,6 @@ def play(
             library_id,
         )
 
-    xbmcplugin.setResolvedUrl(
-        HANDLE,
-        True,
-        resolved_item,
-    )
-
     # Fetch version markers before entering the playback monitor. The monitor
     # receives prepared spans rather than reaching back into play()'s local
     # variables (content_id, file_id, library_id, detail).
@@ -9478,6 +9472,14 @@ def play(
             % (content_id, exc),
             xbmc.LOGDEBUG,
         )
+
+    # Publish the fully decorated item only after the seek and marker
+    # preview properties have been attached, so Kodi skins can read them.
+    xbmcplugin.setResolvedUrl(
+        HANDLE,
+        True,
+        resolved_item,
+    )
 
     session_id = info.get("session_id")
 
