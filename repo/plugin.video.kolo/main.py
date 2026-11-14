@@ -3131,9 +3131,9 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
     if hide_episode_image:
         # Unknown provenance is protected conservatively. Prefer known show
         # artwork where possible; never expose the episode still as a fallback.
-        if catalog_item.get("poster_is_episode_still") is not False:
+        if catalog_item.get("poster_is_episode_still", (detail or {}).get("poster_is_episode_still")) is not False:
             poster = None
-        if catalog_item.get("backdrop_is_episode_still") is not False:
+        if catalog_item.get("backdrop_is_episode_still", (detail or {}).get("backdrop_is_episode_still")) is not False:
             backdrop = None
         item.setProperty("Kolo.SpoilerProtected", "true")
     set_art(
