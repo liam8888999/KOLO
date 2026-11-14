@@ -2910,7 +2910,7 @@ class SiloClient:
 
     # an observed effective bandwidth estimate.
 
-    def replan_playback(self, info, position, bandwidth_estimate_kbps=None, quality_preference="auto", operation="failure_recovery", failure=None):
+    def replan_playback(self, info, position, bandwidth_estimate_kbps=None, quality_preference="auto", operation="failure_recovery", failure=None, timeout=90):
 
         plan = (info or {}).get("playback_plan") or {}
         session_id = (info or {}).get("session_id") or plan.get("session_id")
@@ -3011,7 +3011,7 @@ class SiloClient:
             "POST",
             "/api/v2/playback/%s/replan" % session_id,
             body=body,
-            timeout=90,
+            timeout=timeout,
         ) or {}
 
         new_plan = data.get("playback_plan")
