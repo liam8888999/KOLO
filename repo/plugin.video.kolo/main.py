@@ -9445,7 +9445,7 @@ def play(
                             return {
                                 key: (
                                     client.abs_url(child)
-                                    if key.endswith("_url") and isinstance(child, str)
+                                    if (key == "url" or key.endswith("_url")) and isinstance(child, str)
                                     else absolutize_preview_urls(child)
                                 )
                                 for key, child in value.items()
@@ -10407,6 +10407,14 @@ def track_progress(
                 active_plan_id = str(active_plan.get("plan_id") or "")
                 command_status = "completed"
                 if invalidated_plan_id and invalidated_plan_id == active_plan_id:
+                    # Stop advancing the withdrawn transport while the server
+                    # chooses its replacement; the same source position is the
+                    # anchor for the recovery plan.
+                    try:
+                        if player.isPlaying() and not xbmc.getCondVisibility("Player.Paused"):
+                            player.pause()
+                    except Exception:
+                        pass
                     try:
                         current_position = max(0.0, float(player.getTime()))
                     except Exception:
@@ -10444,6 +10452,11 @@ def track_progress(
                     except Exception as exc:
                         command_status = "rejected"
                         log("Silo plan invalidation recovery failed: %s" % exc, xbmc.LOGWARNING)
+                if command_status == "rejected" and invalidated_plan_id == active_plan_id:
+                    try:
+                        player.stop()
+                    except Exception:
+                        pass
                 if command_id:
                     try:
                         control_ws.send({
