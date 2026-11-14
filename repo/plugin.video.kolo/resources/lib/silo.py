@@ -856,6 +856,7 @@ class SiloClient:
             params.append((str(name), str(item)))
         headers = {"X-Silo-Client-Family": "tv"}
         if scope == "profile_device":
+            self._headers()
             headers["X-Silo-Device-Id"] = str(self.cfg.get("device_id") or _setting("device_id") or "")
         return self._json(
             "PUT",
