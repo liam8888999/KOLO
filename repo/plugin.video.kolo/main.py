@@ -3606,12 +3606,13 @@ def _server_setting_prompt(definition, current):
     return False, None
 
 
-def _server_setting_scopes(definition):
+def _server_setting_scopes(definition, revision=None):
     supported = ("account", "profile", "profile_client", "profile_device", "profile_library", "profile_series")
     result = []
     for entry in definition.get("allowed_scopes") or []:
         scope = entry.get("scope") if isinstance(entry, dict) else entry
-        if scope in supported:
+        introduced = entry.get("introduced_in", 1) if isinstance(entry, dict) else 1
+        if scope in supported and (revision is None or int(introduced or 1) <= revision):
             result.append(scope)
     return result
 
@@ -3646,7 +3647,7 @@ def list_server_settings(client):
             if isinstance(d, dict) and d.get("persistence") == "remote"
             and not d.get("deprecated")
             and int(d.get("introduced_in") or 1) <= revision
-            and _server_setting_scopes(d)
+            and _server_setting_scopes(d, revision)
         ]
         keys = [d.get("key") for d in definitions if d.get("key")]
         effective = client.effective_setting_values(keys)
@@ -3678,7 +3679,7 @@ def list_server_settings(client):
 
     definition = entries[setting_index]
     key = str(definition.get("key") or "")
-    scopes = _server_setting_scopes(definition)
+    scopes = _server_setting_scopes(definition, revision)
     scope_labels = {
         "account": "Account (all profiles)",
         "profile": "This profile",
