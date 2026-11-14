@@ -9715,8 +9715,8 @@ def _start_playback_control_socket(client, playback_info, pending_events):
                                  "session_id": session_id, "status": "accepted"})
                         pending_events.put(("plan_invalidated", message, ws))
                 elif (
-                    message.get("type") == "event"
-                    and (message.get("name") or message.get("event")) == "marker_thumbnail_ready"
+                    (message.get("name") or message.get("event") or message.get("type"))
+                    == "marker_thumbnail_ready"
                 ):
                     pending_events.put((
                         "marker_thumbnail_ready",
@@ -10533,7 +10533,8 @@ def track_progress(
 
             if event_name == "marker_thumbnail_ready":
                 try:
-                    if str(payload.get("file_id") or "") == str(playback_info.get("file_id") or ""):
+                    event_file_id = payload.get("file_id") or ""
+                    if not event_file_id or str(event_file_id) == str(playback_info.get("file_id") or ""):
                         occurrence = payload.get("occurrence") or payload.get("marker") or payload
                         occurrence_id = str(
                             payload.get("occurrence_id")
