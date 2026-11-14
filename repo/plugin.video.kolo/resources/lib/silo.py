@@ -801,6 +801,10 @@ class SiloClient:
         return manifest, capabilities
 
     def effective_setting_values(self, keys=None, library_ids=None, series_ids=None):
+        # Ensure the stable Kodi device id exists before building the extra
+        # Silo identity header (which otherwise could overwrite it with "").
+        self._headers()
+        device_id = str(self.cfg.get("device_id") or _setting("device_id") or "")
         params = []
         for key in keys or []:
             params.append(("keys", str(key)))
@@ -810,7 +814,7 @@ class SiloClient:
             params.append(("series_ids", str(series_id)))
         headers = {
             "X-Silo-Client-Family": "tv",
-            "X-Silo-Device-Id": str(self.cfg.get("device_id") or _setting("device_id") or ""),
+            "X-Silo-Device-Id": device_id,
         }
         data = self._json(
             "GET", "/api/v2/settings/values/effective",
@@ -832,6 +836,7 @@ class SiloClient:
             params.append(("keys", str(key)))
         headers = {"X-Silo-Client-Family": "tv"}
         if scope == "profile_device":
+            self._headers()
             headers["X-Silo-Device-Id"] = str(self.cfg.get("device_id") or _setting("device_id") or "")
         data = self._json(
             "GET", "/api/v2/settings/values",
