@@ -876,6 +876,29 @@ class SiloClient:
             timeout=30,
         )
 
+
+    def list_plugin_settings(self):
+        data = self._json(
+            "GET", "/api/v2/settings/plugins",
+            timeout=30,
+        ) or {}
+        return data.get("items") or []
+
+    def get_plugin_settings(self, installation_id):
+        return self._json(
+            "GET",
+            "/api/v2/settings/plugins/%s" % quote(str(installation_id), safe=""),
+            timeout=30,
+        ) or {}
+
+    def update_plugin_settings(self, installation_id, values):
+        return self._json(
+            "PUT",
+            "/api/v2/settings/plugins/%s" % quote(str(installation_id), safe=""),
+            body={"values": values},
+            timeout=30,
+        ) or {}
+
     def admin_settings_snapshot(self):
         response = self._send(
             "GET", "/api/v2/admin/settings/effective",
