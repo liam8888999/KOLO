@@ -4227,7 +4227,8 @@ class _SiloWebSocket:
             "Sec-WebSocket-Version: 13\\r\\n"
         ) % (path, host_header, self.origin, key)
         for header_name, header_value in self.headers.items():
-            request += "%s: %s\\r\\n" % (header_name, header_value)
+            safe_value = str(header_value).encode("ascii", "ignore").decode("ascii")
+            request += "%s: %s\\r\\n" % (header_name, safe_value)
         if self.protocols:
             request += "Sec-WebSocket-Protocol: %s\\r\\n" % ", ".join(self.protocols)
         request += "\\r\\n"
@@ -10622,7 +10623,7 @@ def track_progress(
                             "auto",
                             expected_source_url=playback_info.get("url"),
                             request_started_at=replan_started_at,
-                            attach_timeout=1.0,
+                            attach_timeout=2.0,
                         ):
                             command_status = "rejected"
                         else:
