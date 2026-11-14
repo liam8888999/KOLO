@@ -785,6 +785,132 @@ class SiloClient:
         r = self._send(*args, **kwargs)
         return r.json() if r.content else None
 
+
+    # ------------------------------------------------------ server settings
+
+    def settings_contract(self):
+        manifest_response = self._send(
+            "GET", "/api/v2/settings/contract",
+            need_profile=False, timeout=30,
+        )
+        manifest = manifest_response.json() if manifest_response.content else {}
+        capabilities = self._json(
+            "GET", "/api/v2/settings/contract/capabilities",
+            need_profile=False, timeout=20,
+        ) or {}
+        return manifest, capabilities
+
+    def effective_setting_values(self, keys=None, library_ids=None, series_ids=None):
+        params = []
+        for key in keys or []:
+            params.append(("keys", str(key)))
+        for library_id in library_ids or []:
+            params.append(("library_ids", str(library_id)))
+        for series_id in series_ids or []:
+            params.append(("series_ids", str(series_id)))
+        headers = {
+            "X-Silo-Client-Family": "tv",
+            "X-Silo-Device-Id": str(self.cfg.get("device_id") or _setting("device_id") or ""),
+        }
+        data = self._json(
+            "GET", "/api/v2/settings/values/effective",
+            params=params,
+            extra_headers=headers,
+            timeout=30,
+        ) or {}
+        return {
+            str(item.get("key")): item
+            for item in (data.get("items") or [])
+            if isinstance(item, dict) and item.get("key")
+        }
+
+    def explicit_setting_values(self, scope, keys=None, identity=None):
+        params = [("scope", str(scope))]
+        for name, value in (identity or {}).items():
+            params.append((str(name), str(value)))
+        for key in keys or []:
+            params.append(("keys", str(key)))
+        headers = {"X-Silo-Client-Family": "tv"}
+        if scope == "profile_device":
+            headers["X-Silo-Device-Id"] = str(self.cfg.get("device_id") or _setting("device_id") or "")
+        data = self._json(
+            "GET", "/api/v2/settings/values",
+            params=params,
+            extra_headers=headers,
+            timeout=30,
+        ) or {}
+        return {
+            str(item.get("key")): item
+            for item in (data.get("items") or [])
+            if isinstance(item, dict) and item.get("key")
+        }
+
+    def update_setting_value(self, scope, key, value, identity=None):
+        params = [("scope", str(scope))]
+        for name, item in (identity or {}).items():
+            params.append((str(name), str(item)))
+        headers = {"X-Silo-Client-Family": "tv"}
+        if scope == "profile_device":
+            headers["X-Silo-Device-Id"] = str(self.cfg.get("device_id") or _setting("device_id") or "")
+        return self._json(
+            "PUT",
+            "/api/v2/settings/values/%s" % quote(str(key), safe=""),
+            params=params,
+            body={"value": value},
+            extra_headers=headers,
+            timeout=30,
+        )
+
+    def delete_setting_value(self, scope, key, identity=None):
+        params = [("scope", str(scope))]
+        for name, item in (identity or {}).items():
+            params.append((str(name), str(item)))
+        headers = {"X-Silo-Client-Family": "tv"}
+        if scope == "profile_device":
+            headers["X-Silo-Device-Id"] = str(self.cfg.get("device_id") or _setting("device_id") or "")
+        self._send(
+            "DELETE",
+            "/api/v2/settings/values/%s" % quote(str(key), safe=""),
+            params=params,
+            extra_headers=headers,
+            timeout=30,
+        )
+
+    def admin_settings_snapshot(self):
+        response = self._send(
+            "GET", "/api/v2/admin/settings/effective",
+            need_profile=False, timeout=30,
+        )
+        payload = response.json() if response.content else {}
+        values = payload.get("values", payload) if isinstance(payload, dict) else {}
+        if not isinstance(values, dict):
+            values = {}
+        validator = str(response.headers.get("ETag") or "")
+        if not validator:
+            raise SiloError("The server did not provide an ETag for safe administrator settings edits.")
+        return values, validator
+
+    def admin_settings_metadata(self):
+        restart = self._json(
+            "GET", "/api/v2/admin/settings/restart-keys",
+            need_profile=False, timeout=20,
+        ) or {}
+        sensitive = self._json(
+            "GET", "/api/v2/admin/settings/sensitive-status",
+            need_profile=False, timeout=20,
+        ) or {}
+        return restart, sensitive
+
+    def update_admin_setting(self, key, value, validator):
+        self._send(
+            "PUT",
+            "/api/v2/admin/settings/%s" % quote(str(key), safe=""),
+            body={"value": str(value)},
+            need_profile=False,
+            extra_headers={"If-Match": str(validator)},
+            timeout=45,
+        )
+
     # --------------------------------------------------------------- auth
 
     # Ask for the server and username the first time the addon is configured.
