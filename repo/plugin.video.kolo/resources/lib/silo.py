@@ -2484,7 +2484,11 @@ class SiloClient:
             for entry in data.get("items") or []:
                 if not isinstance(entry, dict) or entry.get("key") not in defaults:
                     continue
-                defaults[entry["key"]] = bool(entry.get("value"))
+                raw_value = entry.get("value")
+                defaults[entry["key"]] = (
+                    raw_value if isinstance(raw_value, bool)
+                    else str(raw_value).strip().lower() in ("1", "true", "yes", "on")
+                )
         except (SiloError, TypeError, ValueError) as exc:
             log("Episode spoiler settings unavailable; leaving episode metadata unchanged: %s" % exc, xbmc.LOGDEBUG)
         self._episode_spoiler_settings = defaults
