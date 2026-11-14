@@ -8112,6 +8112,7 @@ def list_episodes(client, series_id, season_number, library_id, page=None):
         library_id=library_id,
     )
 
+    spoiler_settings = _episode_spoiler_preferences(client)
     batch = []
 
     for episode in episodes:
@@ -8205,36 +8206,48 @@ def list_episodes(client, series_id, season_number, library_id, page=None):
             except (TypeError, ValueError):
                 pass
 
-        plot = metadata_episode.get("overview") or metadata_episode.get("plot")
-        if plot:
-            tag.setPlot(str(plot))
-            tag.setPlotOutline(str(plot))
-
-        set_art(
-            item,
-            client,
-            poster=(
-                metadata_episode.get("poster_url")
-                or metadata_episode.get("poster")
-                or metadata_episode.get("image")
-                or metadata_episode.get("thumbnail")
-            ),
-            backdrop=metadata_episode.get("backdrop_url"),
-            logo=metadata_episode.get("logo_url"),
-            still=(
-                metadata_episode.get("still_url")
-                or metadata_episode.get("still")
-            ),
-        )
-
-        if detail:
-            set_detail_metadata(item, detail, client)
-
         display_progress = (
             progress_map.get(str(content_id))
             or catalog_progress(detail)
             or catalog_progress(episode)
         )
+        unwatched = _episode_is_unwatched(display_progress, metadata_episode)
+        hide_image = unwatched and spoiler_settings.get("catalog.hide_unwatched_episode_images", False)
+        hide_overview = unwatched and spoiler_settings.get("catalog.hide_unwatched_episode_overviews", False)
+
+        plot = metadata_episode.get("overview") or metadata_episode.get("plot")
+        if plot and not hide_overview:
+            tag.setPlot(str(plot))
+            tag.setPlotOutline(str(plot))
+
+        episode_poster = (
+            metadata_episode.get("poster_url") or metadata_episode.get("poster")
+            or metadata_episode.get("image") or metadata_episode.get("thumbnail")
+        )
+        episode_backdrop = metadata_episode.get("backdrop_url")
+        episode_still = metadata_episode.get("still_url") or metadata_episode.get("still")
+        if hide_image:
+            if metadata_episode.get("poster_is_episode_still") is not False:
+                episode_poster = series_detail.get("poster_url") or series_detail.get("poster")
+            if metadata_episode.get("backdrop_is_episode_still") is not False:
+                episode_backdrop = series_detail.get("backdrop_url")
+            episode_still = None
+            item.setProperty("Kolo.SpoilerProtected", "true")
+
+        set_art(
+            item, client,
+            poster=episode_poster,
+            backdrop=episode_backdrop,
+            logo=metadata_episode.get("logo_url"),
+            still=episode_still,
+        )
+
+        if detail:
+            set_detail_metadata(item, detail, client)
+        if hide_overview:
+            tag.setPlot("")
+            tag.setPlotOutline("")
+            item.setProperty("Kolo.SpoilerOverviewHidden", "true")
 
         set_watch_state(item, display_progress, "episode")
         item.setProperty("IsPlayable", "true")
