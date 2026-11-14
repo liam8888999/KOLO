@@ -531,6 +531,17 @@ class SiloClient:
     # send_profile=False leaves out X-Profile-Id/X-Profile-Token, which the
     # PIN check must not send: the server refuses a request naming a locked
     # profile without its token, so that request would never reach the check.
+    def _device_identity_headers(self):
+        """Return the device identity Silo stores on a login session."""
+        device_id = _setting("device_id") or self.cfg.get("device_id") or ""
+        friendly_name = str(xbmc.getInfoLabel("System.FriendlyName") or "").strip()
+        device_name = "Kodi on %s" % friendly_name if friendly_name else "Kodi"
+        return {
+            "X-Silo-Device-Id": device_id,
+            "X-Silo-Device-Name": device_name,
+            "X-Silo-Device-Platform": "Kodi",
+        }
+
     def _headers(self, send_profile=True):
         # Kodi's settings store is authoritative. Read the live values
         # directly instead of relying on a potentially stale in-memory cfg.
@@ -552,6 +563,7 @@ class SiloClient:
             "X-Client-Version": ADDON_VERSION,
             "X-Client-Platform": "kodi",
         }
+        h.update(self._device_identity_headers())
 
         if token:
             h["Authorization"] = "Bearer " + token
@@ -661,7 +673,11 @@ class SiloClient:
             try:
                 r = self.session.request(
                     method,
-                    self.base + path,
+                    (
+                        path
+                        if str(path).startswith(("http://", "https://"))
+                        else self.base + path
+                    ),
                     headers=headers,
                     params=params,
                     json=body,
@@ -888,13 +904,7 @@ class SiloClient:
             r = self.session.post(
                 self.base + "/api/v2/auth/login",
                 timeout=20,
-                headers={
-                    "Accept": "application/json",
-                    "X-Device-ID": self.cfg["device_id"],
-                    "X-Client-Name": "plugin.video.kolo",
-                    "X-Client-Version": ADDON_VERSION,
-                    "X-Client-Platform": "kodi",
-                },
+                headers=self._client_headers(),
                 json={
                     "username": self.cfg["username"],
                     "password": pw,
@@ -922,13 +932,15 @@ class SiloClient:
 
     # Headers for requests made before the addon has a session.
     def _client_headers(self):
-        return {
+        headers = {
             "Accept": "application/json",
             "X-Device-ID": _setting("device_id") or self.cfg["device_id"],
             "X-Client-Name": "plugin.video.kolo",
             "X-Client-Version": ADDON_VERSION,
             "X-Client-Platform": "kodi",
         }
+        headers.update(self._device_identity_headers())
+        return headers
 
     # Fetch an unauthenticated JSON document, or None when the server does
     # not answer it (an older server without the endpoint, or a network error).
@@ -1336,13 +1348,7 @@ class SiloClient:
                 try:
                     r = self.session.post(
                         self.base + "/api/v2/auth/refresh",
-                        headers={
-                            "Accept": "application/json",
-                            "X-Device-ID": _setting("device_id") or self.cfg["device_id"],
-                            "X-Client-Name": "plugin.video.kolo",
-                            "X-Client-Version": ADDON_VERSION,
-                            "X-Client-Platform": "kodi",
-                        },
+                        headers=self._client_headers(),
                         json={"refresh_token": rt},
                         timeout=20,
                     )
@@ -1860,7 +1866,7 @@ class SiloClient:
     # Search the profile-visible catalog across all accessible libraries.
     # Silo performs the search server-side, so the addon does not need to
     # download and scan every library itself.
-    def search_people(self, query, limit=20):
+    def search_people(self, query, limit=20, media_scope=None):
         """Search profile-visible Silo people by name."""
         query = str(query or "").strip()
         if not query:
@@ -1871,13 +1877,22 @@ class SiloClient:
         except (TypeError, ValueError):
             limit = 20
 
+        if media_scope is None:
+            capabilities = self.catalog_search_capabilities()
+            media_scope = (
+                "video_with_episodes"
+                if capabilities.get("video_with_episodes_scope") is True
+                else "video"
+            )
+        params = {
+            "q": query,
+            "limit": limit,
+            "media_scope": media_scope,
+        }
         data = self._json(
             "GET",
             "/api/v2/catalog/people",
-            params={
-                "q": query,
-                "limit": limit,
-            },
+            params=params,
         ) or {}
 
         return data.get("items", [])
@@ -1912,7 +1927,7 @@ class SiloClient:
             self._next(data),
         )
 
-    def search_catalog(self, query, limit=100, offset=0):
+    def search_catalog(self, query, limit=100, offset=0, cursor=None, window_cursor=None):
         """Return one page of Silo's v2 server-side catalog search results.
 
         Keep the add-on's existing page/offset interface, but translate the
@@ -1934,18 +1949,29 @@ class SiloClient:
         except (TypeError, ValueError):
             offset = 0
 
+        capabilities = self.catalog_search_capabilities()
+        media_scope = (
+            "video_with_episodes"
+            if capabilities.get("video_with_episodes_scope") is True
+            else "video"
+        )
         params = {
             "source": "query",
             "q": query,
+            "type": media_scope,
             "limit": limit,
             "skip_total": "true",
             "image_size": "medium",
         }
 
-        # Silo v2 uses seek for a direct jump to the requested zero-based
-        # result window. Page 1 naturally starts at position zero, so omit it.
-        if offset:
+        # Adjacent pages must follow the opaque continuation cursor. Use the
+        # window cursor with seek only for a direct jump (including Previous).
+        if cursor:
+            params["cursor"] = cursor
+        elif offset:
             params["seek"] = offset
+            if window_cursor:
+                params["window_cursor"] = window_cursor
 
         data = self._json(
             "GET",
@@ -1961,7 +1987,7 @@ class SiloClient:
             "total": data.get("total", 0),
             "total_exact": bool(data.get("total_exact", False)),
             "next_cursor": page.get("next_cursor"),
-            "window_cursor": data.get("window_cursor"),
+            "window_cursor": data.get("window_cursor") or window_cursor,
         }
 
     # Join an existing Watch Party. Kodi intentionally exposes no
@@ -2236,6 +2262,45 @@ class SiloClient:
         self._details[key] = data
         return data
 
+    # Return the native watch-state document for one playable item. Unlike
+    # /progress this is a targeted read and includes the acting profile's
+    # user_data alongside the exact file versions, markers and trickplay facts.
+    def watch_detail(self, content_id, library_id=None, file_id=None):
+        content_id = str(content_id or "").strip()
+        if not content_id:
+            return {}
+        params = {"image_size": "small"}
+        if library_id:
+            params["library_id"] = library_id
+        if file_id:
+            params["file_id"] = file_id
+        data = self._json(
+            "GET",
+            "/api/v2/watch/%s" % quote(content_id, safe=":"),
+            params=params,
+        ) or {}
+        if isinstance(data, dict) and isinstance(data.get("body"), dict):
+            data = data["body"]
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def progress_from_watch_detail(watch_detail, content_id=None):
+        """Convert getWatchState user_data into KOLO's common progress shape."""
+        if not isinstance(watch_detail, dict):
+            return None
+        user_data = watch_detail.get("user_data")
+        if not isinstance(user_data, dict):
+            return None
+        return {
+            "media_item_id": str(content_id or watch_detail.get("content_id") or ""),
+            "position_seconds": user_data.get("position_seconds", 0),
+            "duration_seconds": user_data.get("duration_seconds", 0),
+            "completed": bool(user_data.get("played")),
+            "played": bool(user_data.get("played")),
+            "is_in_progress": bool(user_data.get("is_in_progress")),
+            "last_file_id": user_data.get("last_file_id"),
+        }
+
     # Return the playable versions/files for one catalog item.
     def versions(self, content_id, library_id=None):
         data = self._json(
@@ -2313,23 +2378,39 @@ class SiloClient:
         return result
 
     # Return the newest Silo progress record for one catalog media item.
-    def get_progress(self, content_id, library_id=None):
+    def get_progress(self, content_id, library_id=None, watch_detail=None,
+                     watch_detail_loaded=False):
+        """Read one item's authoritative progress without paging all history."""
+        try:
+            detail = watch_detail if watch_detail_loaded else self.watch_detail(
+                content_id, library_id=library_id
+            )
+        except SiloError as exc:
+            # Retain compatibility with older v2 deployments that predate
+            # getWatchState. A missing user_data on a successful watch read is
+            # authoritative and must not trigger a history download.
+            if exc.status not in (404, 501):
+                raise
+            log(
+                "Targeted watch-state read is unavailable; falling back to paged progress: %s" % exc,
+                xbmc.LOGDEBUG,
+            )
+            detail = None
+
+        if detail is not None:
+            return self.progress_from_watch_detail(detail, content_id)
+
         matches = [
             record
             for record in self.progress(library_id=library_id)
             if str(record.get("media_item_id")) == str(content_id)
         ]
-
         if not matches:
             return None
-
-        # Silo returns newest-change-first, but sorting explicitly means this
-        # method remains correct even if the API ordering changes later.
         matches.sort(
             key=lambda record: record.get("updated_at") or "",
             reverse=True,
         )
-
         return matches[0]
 
     # Build a single lookup map containing the newest record for each media item.
@@ -2451,9 +2532,16 @@ class SiloClient:
         bytes_received = 0
         now = None
         try:
+            # Prefer the server-advertised media-path probe. It follows the
+            # same direct-play egress route as media, which can differ from the
+            # API origin when Silo serves files through a proxy or remote node.
+            probe_url = (
+                caps.get("bandwidth_probe_url")
+                or "/api/v2/playback/bandwidth-probe"
+            )
             response = self._send(
                 "GET",
-                "/api/v2/playback/bandwidth-probe",
+                probe_url,
                 params={"size": 40000000},
                 need_profile=False,
                 timeout=(5, 2),
@@ -2518,6 +2606,7 @@ class SiloClient:
         direct_play_only=False, kodi_source_version=None
     ):
         caps = self.playback_caps()
+        supported_features = set(caps.get("features") or [])
         pv = self._protocol_version()
         output_hdr_details = _kodi_output_hdr_details()
         quality_preference = str(quality_preference or "auto").strip()
@@ -2649,7 +2738,16 @@ class SiloClient:
         hls_delivery["video_codecs"] = ["h264"]
         hls_delivery["audio_decode_codecs"] = ["aac"]
         hls_delivery["audio_passthrough_codecs"] = []
+        hls_features = list(hls_delivery.get("features") or [])
+        for feature in ("hls_copy_mpegts_v1", "hls_variable_substitution_v1"):
+            if feature in supported_features and feature not in hls_features:
+                hls_features.append(feature)
+        hls_delivery["features"] = hls_features
         deliveries["hls"] = hls_delivery
+
+        # Do not advertise progressive_range_refusal_v1 until Kodi exposes
+        # a reliable HTTP 409/range-refusal callback that KOLO can use to
+        # reopen the remux at the current source position.
 
         # These declarations are about what the active output can display,
         # not what the server can encode. Replace any generic/server-default
@@ -2674,8 +2772,17 @@ class SiloClient:
             hls_delivery["enabled"] = False
             hls_delivery["supported_on_device"] = False
 
-        supported_features = set(caps.get("features") or [])
         client_features = ["playback_plan_v3", "seek_reanchor_v1"]
+        # Kodi's native player supports SRT sidecars and can consume the
+        # original SubRip file without a server-side WebVTT conversion.
+        if "subrip_sidecar_v1" in supported_features:
+            client_features.append("subrip_sidecar_v1")
+        # Enable server-side learned buffering limits only on servers that
+        # explicitly advertise the v2 feature.
+        if "buffering_quality_v1" in supported_features:
+            client_features.append("buffering_quality_v1")
+        if "playback_plan_summary_v1" in supported_features:
+            client_features.append("playback_plan_summary_v1")
         # Kodi's native player can consume the HLS SUBTITLES group. Add the
         # optional rendition features only when this server advertises them.
         if "hls_subtitle_renditions_v1" in supported_features:
@@ -2734,6 +2841,8 @@ class SiloClient:
             estimate = self.measure_bandwidth_kbps()
             if estimate is not None:
                 body["bandwidth_estimate_kbps"] = estimate
+                if "buffering_quality_v1" in client_features:
+                    body["bandwidth_estimate_source"] = "probe"
 
         return body
 
@@ -2835,6 +2944,11 @@ class SiloClient:
 
         if bandwidth_estimate_kbps is not None:
             body["bandwidth_estimate_kbps"] = bandwidth_estimate_kbps
+            if (
+                "buffering_quality_v1" in body.get("client_features", [])
+                and quality_preference == "auto"
+            ):
+                body["bandwidth_estimate_source"] = "probe"
 
         data = self._json(
             "POST",
@@ -3187,6 +3301,43 @@ class SiloClient:
                 "is_paused": bool(paused),
             },
         )
+
+    # Send one v2 playback telemetry event. Route events are best-effort:
+    # failures must never interrupt playback or session cleanup.
+    def report_route_event(self, playback_info, event, diagnostics=None):
+        info = playback_info or {}
+        plan = info.get("playback_plan") or {}
+        attempt_id = str(info.get("playback_attempt_id") or "")
+        if not attempt_id:
+            return False
+        body = {
+            "installation_id": self._installation_id(),
+            "event_id": str(uuid.uuid4()),
+            "protocol_version": 3,
+            "playback_attempt_id": attempt_id,
+            "event": str(event or ""),
+        }
+        for key, value in (
+            ("session_id", info.get("session_id")),
+            ("plan_id", plan.get("plan_id")),
+            ("plan_attempt_id", info.get("plan_attempt_id")),
+            ("plan_attempt_key", plan.get("plan_attempt_key")),
+        ):
+            if value not in (None, ""):
+                body[key] = str(value)
+        if diagnostics:
+            body["diagnostics"] = {
+                str(key): str(value)
+                for key, value in diagnostics.items()
+                if value is not None
+            }
+        self._send(
+            "POST",
+            "/api/v2/playback/route-events",
+            body=body,
+            timeout=10,
+        )
+        return True
 
     # Tell Silo that the playback session ended.
     def stop_playback(self, session_id, sequence, position):

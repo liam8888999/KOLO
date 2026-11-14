@@ -58,7 +58,31 @@ def segments(version, offset=0.0):
         markers = {}
 
     result = []
-    for kind in ("intro", "credits"):
+    occurrences = version.get("marker_segments")
+    if isinstance(occurrences, list):
+        # Native v2 watch detail returns every effective marker occurrence in
+        # source-time order. Keep repeated ranges independent so an intro and
+        # a later recap/credits segment never become one broad skip.
+        for marker in occurrences:
+            if not isinstance(marker, dict):
+                continue
+            kind = str(marker.get("kind") or "").strip().lower()
+            if kind not in ("intro", "recap", "credits"):
+                continue
+            span = _span(
+                marker.get("start_seconds", marker.get("start")),
+                marker.get("end_seconds", marker.get("end")),
+                offset,
+            )
+            if span:
+                span["kind"] = kind
+                result.append(span)
+
+    # Singular marker fields remain a compatibility fallback for older
+    # servers and for a kind omitted from marker_segments.
+    for kind in ("intro", "recap", "credits"):
+        if any(item.get("kind") == kind for item in result):
+            continue
         marker = version.get(kind)
         if not isinstance(marker, dict):
             marker = markers.get(kind)
@@ -95,7 +119,6 @@ def segments(version, offset=0.0):
             ):
                 span["kind"] = "recap"
                 result.append(span)
-            break
 
     return sorted(result, key=lambda item: (item["start"], item["end"]))
 

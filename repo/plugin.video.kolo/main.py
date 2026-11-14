@@ -1431,6 +1431,23 @@ def set_catalog_metadata(list_item, item, client):
     tag = list_item.getVideoInfoTag()
     media_type = (item.get("type") or item.get("media_type") or "").lower()
 
+    # New v2 artwork provenance lets skins distinguish an episode still from
+    # series artwork after the server's fallback selection.
+    for field, prop in (
+        ("poster_is_episode_still", "Kolo.Artwork.PosterIsEpisodeStill"),
+        ("backdrop_is_episode_still", "Kolo.Artwork.BackdropIsEpisodeStill"),
+        ("still_is_episode_still", "Kolo.Artwork.StillIsEpisodeStill"),
+    ):
+        if field in item:
+            list_item.setProperty(prop, "true" if item.get(field) is True else "false")
+
+    files = item.get("files") or []
+    if files and all(
+        isinstance(file_item, dict) and file_item.get("unreadable") is True
+        for file_item in files
+    ):
+        list_item.setProperty("Kolo.Unreadable", "true")
+
     # Kodi media types map Silo's catalog types to the native video types.
     kodi_media_type = {
         "movie": "movie",
@@ -1521,6 +1538,17 @@ def set_catalog_metadata(list_item, item, client):
                 str(item["original_language"]),
             )
 
+    if item.get("play_content_id"):
+        list_item.setProperty(
+            "Kolo.PlayTargetContentID",
+            str(item.get("play_content_id")),
+        )
+    if item.get("play_season_number") is not None:
+        list_item.setProperty(
+            "Kolo.PlayTargetSeason",
+            str(item.get("play_season_number")),
+        )
+
     series_title = (
         item.get("series_title")
         or item.get("series_name")
@@ -1597,6 +1625,27 @@ def set_catalog_metadata(list_item, item, client):
             ratings[rating_type] = (float(value), 0)
         except (TypeError, ValueError):
             pass
+
+    # Episode rows use the newer CatalogRating array (score is 0-100),
+    # while older catalog cards expose the flat rating_* fields above.
+    for rating in item.get("ratings") or []:
+        if not isinstance(rating, dict):
+            continue
+        source = str(rating.get("name") or "").strip().lower()
+        rating_type = {
+            "imdb": "imdb",
+            "tmdb": "tmdb",
+            "rotten tomatoes critic": "rotten_tomatoes_critic",
+            "rotten tomatoes audience": "rotten_tomatoes_audience",
+        }.get(source)
+        if not rating_type or rating_type in ratings:
+            continue
+        try:
+            score = float(rating.get("score")) / 10.0
+        except (TypeError, ValueError):
+            continue
+        if 0 < score <= 10:
+            ratings[rating_type] = (score, 0)
 
     if ratings:
         default_rating = "imdb" if "imdb" in ratings else next(iter(ratings))
@@ -2066,7 +2115,11 @@ def set_detail_metadata(list_item, detail, client, file_id=None):
         list_item,
         client,
         poster=detail.get("poster_url") or detail.get("poster") or detail.get("image"),
-        backdrop=detail.get("backdrop_url") or detail.get("backdrop"),
+        backdrop=(
+            detail.get("backdrop_url")
+            or detail.get("backdrop")
+            or ((detail.get("backdrop_urls") or [None])[0])
+        ),
         logo=detail.get("logo_url") or detail.get("logo"),
         still=detail.get("still_url") or detail.get("still"),
         banner=detail.get("banner_url") or detail.get("banner"),
@@ -2568,7 +2621,11 @@ def add_catalog_item(client, item, library_id):
         list_item,
         client,
         poster=item.get("poster_url") or item.get("poster") or item.get("image") or item.get("artwork") or item.get("thumbnail"),
-        backdrop=item.get("backdrop_url") or item.get("backdrop"),
+        backdrop=(
+            item.get("backdrop_url")
+            or item.get("backdrop")
+            or ((item.get("backdrop_urls") or [None])[0])
+        ),
         logo=item.get("logo_url") or item.get("logo"),
         still=item.get("still_url") or item.get("still"),
         banner=item.get("banner_url") or item.get("banner"),
@@ -3043,7 +3100,14 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
             or (detail or {}).get("poster")
             or (detail or {}).get("image")
         ),
-        backdrop=catalog_item.get("backdrop_url") or catalog_item.get("backdrop") or (detail or {}).get("backdrop_url") or (detail or {}).get("backdrop"),
+        backdrop=(
+            catalog_item.get("backdrop_url")
+            or catalog_item.get("backdrop")
+            or ((catalog_item.get("backdrop_urls") or [None])[0])
+            or (detail or {}).get("backdrop_url")
+            or (detail or {}).get("backdrop")
+            or (((detail or {}).get("backdrop_urls") or [None])[0])
+        ),
         logo=catalog_item.get("logo_url") or catalog_item.get("logo") or (detail or {}).get("logo_url") or (detail or {}).get("logo"),
         still=catalog_item.get("still_url") or catalog_item.get("still") or (detail or {}).get("still_url") or (detail or {}).get("still"),
         banner=catalog_item.get("banner_url") or catalog_item.get("banner") or (detail or {}).get("banner_url") or (detail or {}).get("banner"),
@@ -3076,7 +3140,7 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
     return item, media_type, content_id, title, display_progress
 
 
-def list_search_results(client, query, page=1):
+def list_search_results(client, query, page=1, cursor=None, window_cursor=None):
     """Display one page of Silo's server-side library-wide search results."""
     query = str(query or "").strip()
 
@@ -3099,6 +3163,14 @@ def list_search_results(client, query, page=1):
     people_client.cfg.update(client.cfg)
     box_sets_client = SiloClient()
     box_sets_client.cfg.update(client.cfg)
+    # Resolve capabilities before launching concurrent searches so the shared
+    # client never races two capability requests through one requests.Session.
+    search_capabilities = client.catalog_search_capabilities()
+    people_scope = (
+        "video_with_episodes"
+        if search_capabilities.get("video_with_episodes_scope") is True
+        else "video"
+    )
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         media_future = executor.submit(
@@ -3106,11 +3178,14 @@ def list_search_results(client, query, page=1):
             query,
             limit=search_page_size,
             offset=offset,
+            cursor=cursor,
+            window_cursor=window_cursor,
         )
         people_future = executor.submit(
             people_client.search_people,
             query,
             limit=50,
+            media_scope=people_scope,
         )
         box_sets_future = executor.submit(
             box_sets_client.search_box_sets,
@@ -3228,6 +3303,7 @@ def list_search_results(client, query, page=1):
                 action="search",
                 query=query,
                 page=page_number - 1,
+                window_cursor=data.get("window_cursor") or window_cursor or "",
             ),
             previous_item,
             True,
@@ -3369,6 +3445,8 @@ def list_search_results(client, query, page=1):
                 action="search",
                 query=query,
                 page=page_number + 1,
+                cursor=data.get("next_cursor") or "",
+                window_cursor=data.get("window_cursor") or window_cursor or "",
             ),
             next_item,
             True,
@@ -5837,7 +5915,11 @@ def _start_watch_party_guest_playback(
                 item,
                 client,
                 poster=detail.get("poster_url") or detail.get("poster"),
-                backdrop=detail.get("backdrop_url") or detail.get("backdrop"),
+                backdrop=(
+                    detail.get("backdrop_url")
+                    or detail.get("backdrop")
+                    or ((detail.get("backdrop_urls") or [None])[0])
+                ),
                 logo=detail.get("logo_url") or detail.get("logo"),
                 still=detail.get("still_url") or detail.get("still"),
             )
@@ -8981,18 +9063,41 @@ def play(
         )
 
     latest_progress = None
+    watch_detail = None
 
     if not use_kodi_resume_cache:
         try:
-            latest_progress = client.get_progress(
+            # One targeted watch-state read supplies resume state and the
+            # selected file's marker/trickplay metadata; avoid /progress scans.
+            watch_detail = client.watch_detail(
                 content_id,
-                library_id,
+                library_id=library_id,
+                file_id=file_id,
+            )
+            latest_progress = client.progress_from_watch_detail(
+                watch_detail,
+                content_id,
             )
         except SiloError as exc:
-            log(
-                "Fresh progress lookup failed; continuing without Silo resume: %s" % exc,
-                xbmc.LOGWARNING,
-            )
+            if exc.status in (404, 501):
+                try:
+                    latest_progress = client.get_progress(
+                        content_id,
+                        library_id,
+                        watch_detail_loaded=True,
+                    )
+                except SiloError as fallback_exc:
+                    log(
+                        "Legacy progress fallback failed; continuing without Silo resume: %s"
+                        % fallback_exc,
+                        xbmc.LOGWARNING,
+                    )
+            else:
+                log(
+                    "Targeted Silo watch-state lookup failed; continuing without resume: %s"
+                    % exc,
+                    xbmc.LOGWARNING,
+                )
     else:
         log(
             "Using Kodi cached resume position %.3fs for content %s"
@@ -9248,14 +9353,23 @@ def play(
     # variables (content_id, file_id, library_id, detail).
     if ADDON.getSettingBool("skip_segments_enabled"):
         try:
-            versions = client.versions(content_id, library_id) or []
+            versions = (watch_detail or {}).get("versions") or []
             selected_version = next(
                 (
                     version for version in versions
-                    if str(version.get("id") or version.get("file_id") or "") == str(file_id)
+                    if str(version.get("file_id") or version.get("id") or "") == str(file_id)
                 ),
                 None,
             )
+            if selected_version is None:
+                versions = client.versions(content_id, library_id) or []
+                selected_version = next(
+                    (
+                        version for version in versions
+                        if str(version.get("id") or version.get("file_id") or "") == str(file_id)
+                    ),
+                    None,
+                )
             if selected_version is None and isinstance(detail, dict):
                 selected_version = (
                     detail.get("file_version")
@@ -9271,6 +9385,21 @@ def play(
             if spans:
                 info["_silo_skip_spans"] = spans
                 info["_silo_content_id"] = str(content_id)
+            if selected_version:
+                resolved_item.setProperty(
+                    "Kolo.TrickplayAvailable",
+                    "true" if selected_version.get("trickplay_available") is True else "false",
+                )
+                marker_segments = selected_version.get("marker_segments")
+                if marker_segments:
+                    resolved_item.setProperty(
+                        "Kolo.MarkerSegments",
+                        json.dumps(
+                            marker_segments,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
+                    )
         except Exception as exc:
             log(
                 "Unable to load Silo skip markers for %s: %s"
@@ -9681,10 +9810,6 @@ def track_progress(
         fixed_rungs = [entry for entry in ladder if entry["label"] != "auto"]
 
         preferred = str(info.get("adaptive_quality") or "").strip()
-        if preferred and preferred.lower() not in ("auto", "original"):
-            if any(entry["label"] == preferred for entry in fixed_rungs):
-                return preferred
-
         requested = str(
             info.get("quality_preference")
             or plan.get("quality_preference")
@@ -9692,6 +9817,18 @@ def track_progress(
         ).strip().lower()
         if requested == "original":
             requested = "auto"
+
+        active_quality = str(plan.get("active_quality") or "").strip()
+        if (
+            active_quality
+            and requested != "auto"
+            and any(entry["label"] == active_quality for entry in fixed_rungs)
+        ):
+            return active_quality
+
+        if preferred and preferred.lower() not in ("auto", "original"):
+            if any(entry["label"] == preferred for entry in fixed_rungs):
+                return preferred
 
         delivery = str(plan.get("delivery") or "").strip().lower()
         reason = str(plan.get("decision_reason") or "").strip().lower()
@@ -10028,6 +10165,22 @@ def track_progress(
     stall_started_at = None
     caching_started_at = None
     post_switch_grace_until = 0.0
+    playback_metrics_started_at = time.time()
+    last_metrics_sample_at = playback_metrics_started_at
+    played_seconds = 0.0
+    stall_count = 0
+    stall_total_seconds = 0.0
+    stall_longest_seconds = 0.0
+    buffering_action = "none"
+
+    def close_stall(at):
+        nonlocal stall_started_at, stall_total_seconds, stall_longest_seconds
+        if stall_started_at is None:
+            return
+        elapsed = max(0.0, float(at) - stall_started_at)
+        stall_total_seconds += elapsed
+        stall_longest_seconds = max(stall_longest_seconds, elapsed)
+        stall_started_at = None
 
     # Downward changes happen relatively quickly once sustained buffering is
     # detected. Upward changes require a longer healthy period and must also pass
@@ -10090,7 +10243,7 @@ def track_progress(
                 progress_confirmed = False
                 healthy_since = 0.0
                 caching_started_at = None
-                stall_started_at = None
+                close_stall(time.time())
                 post_switch_grace_until = time.time() + 15.0
                 continue
             log(
@@ -10137,7 +10290,7 @@ def track_progress(
                             last_progress_position = target
                             last_progress_change_at = time.time()
                             caching_started_at = None
-                            stall_started_at = None
+                            close_stall(time.time())
                             seek_grace_until = time.time() + 8.0
                             log("Skipped %s to %.1fs" % (kind, target), xbmc.LOGINFO)
                         except Exception as exc:
@@ -10190,6 +10343,12 @@ def track_progress(
 
         position = max(0.0, position)
         paused = bool(xbmc.getCondVisibility("Player.Paused"))
+        if not paused:
+            played_seconds += max(
+                0.0,
+                min(2.0, now - last_metrics_sample_at),
+            )
+        last_metrics_sample_at = now
 
         # Kodi time can move backwards on resume/jump-back, or jump forwards
         # during a seek/fast-forward. Neither is evidence of a network stall.
@@ -10209,7 +10368,7 @@ def track_progress(
                 last_progress_position = position
                 last_progress_change_at = now
                 caching_started_at = None
-                stall_started_at = None
+                close_stall(now)
                 seek_grace_until = now + 8.0
                 healthy_since = now if progress_confirmed and not paused else 0.0
                 log(
@@ -10232,7 +10391,7 @@ def track_progress(
                 )
 
             caching_started_at = None
-            stall_started_at = None
+            close_stall(now)
             healthy_since = 0.0
         elif last_paused is True:
             # Start a completely fresh health/stall measurement when playback
@@ -10241,7 +10400,7 @@ def track_progress(
             last_progress_position = position
             last_progress_change_at = now
             caching_started_at = None
-            stall_started_at = None
+            close_stall(now)
             healthy_since = now
             log(
                 "Kodi playback resumed; resetting adaptive quality timers.",
@@ -10292,7 +10451,7 @@ def track_progress(
 
             if in_post_switch_grace or in_seek_grace:
                 caching_started_at = None
-                stall_started_at = None
+                close_stall(now)
                 stalled_for = 0.0
 
                 # Start the no-progress timer from the end of the grace window,
@@ -10323,6 +10482,7 @@ def track_progress(
 
                 if position_stalled or caching_stalled:
                     if stall_started_at is None:
+                        stall_count += 1
                         reasons = []
                         if caching_stalled:
                             reasons.append("Kodi caching")
@@ -10367,9 +10527,9 @@ def track_progress(
                             )
 
                     if stall_started_at is not None:
+                        close_stall(now)
                         if progress_confirmed:
                             healthy_since = now
-                        stall_started_at = None
 
                     if healthy_since <= 0 and progress_confirmed:
                         healthy_since = now
@@ -10512,6 +10672,7 @@ def track_progress(
                             known_good_since = switch_time
                             probe_quality = None
 
+                            buffering_action = "downshift"
                             last_down_replan_at = switch_time
                             last_up_replan_at = 0.0
                             downshift_retry_at = 0.0
@@ -10524,7 +10685,7 @@ def track_progress(
                             post_switch_grace_until = (
                                 last_down_replan_at + 15.0
                             )
-                            stall_started_at = None
+                            close_stall(time.time())
 
                             log(
                                 "Adaptive downshift complete: %s -> %s"
@@ -10895,6 +11056,39 @@ def track_progress(
 
     def finish_session():
         try:
+            if (
+                "playback_plan_summary_v1"
+                in (playback_info.get("client_features") or [])
+            ):
+                final_stall = (
+                    max(0.0, time.time() - stall_started_at)
+                    if stall_started_at is not None
+                    else 0.0
+                )
+                total_stall = stall_total_seconds + final_stall
+                longest_stall = max(stall_longest_seconds, final_stall)
+                try:
+                    client.report_route_event(
+                        playback_info,
+                        "plan_summary",
+                        diagnostics={
+                            "played_ms": int(
+                                max(0.0, played_seconds - total_stall) * 1000
+                            ),
+                            "stall_count": stall_count,
+                            "stall_total_ms": int(total_stall * 1000),
+                            "stall_longest_ms": int(longest_stall * 1000),
+                            "buffering_mode": (
+                                "direct_play_only" if direct_play_only else "adaptive"
+                            ),
+                            "buffering_action": buffering_action,
+                        },
+                    )
+                except Exception as telemetry_exc:
+                    log(
+                        "Unable to report Silo playback summary: %s" % telemetry_exc,
+                        xbmc.LOGDEBUG,
+                    )
             client.stop_playback(
                 session_id,
                 sequence,
@@ -10996,6 +11190,8 @@ def router(client):
                 client,
                 query,
                 params.get("page"),
+                params.get("cursor"),
+                params.get("window_cursor"),
             )
         else:
             search_silo(client)
