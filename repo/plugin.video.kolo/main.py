@@ -9900,6 +9900,13 @@ def track_progress(
     playback_info = dict(playback_info or {})
     playback_info["session_id"] = session_id
 
+    # Establish the control channel immediately after the server returns a
+    # session. Silo may withdraw a plan during Kodi's initial decoder startup.
+    pending_control_events = queue.Queue()
+    playback_control = _start_playback_control_socket(
+        client, playback_info, pending_control_events
+    )
+
     if direct_play_only:
         log("Direct-play-only mode enabled; adaptive quality switching is disabled.")
 
@@ -9915,6 +9922,14 @@ def track_progress(
             startup_failure = "decoder_failure"
             break
         if monitor.abortRequested():
+            if playback_control:
+                playback_control["stop"].set()
+                try:
+                    control_ws = playback_control["state"].get("socket")
+                    if control_ws:
+                        control_ws.close()
+                except Exception:
+                    pass
             return
         xbmc.sleep(500)
 
@@ -9947,6 +9962,14 @@ def track_progress(
             "Kodi playback did not start; Silo playback session will not be tracked.",
             xbmc.LOGWARNING,
         )
+        if playback_control:
+            playback_control["stop"].set()
+            try:
+                control_ws = playback_control["state"].get("socket")
+                if control_ws:
+                    control_ws.close()
+            except Exception:
+                pass
         return
 
     if getattr(player, "playback_error_event", None):
@@ -10357,11 +10380,6 @@ def track_progress(
     playback_info["adaptive_quality"] = detect_quality_label(playback_info)
     known_good_quality = playback_info["adaptive_quality"]
     known_good_since = time.time()
-
-    pending_control_events = queue.Queue()
-    playback_control = _start_playback_control_socket(
-        client, playback_info, pending_control_events
-    )
 
     auto_skip = {
         "intro": ADDON.getSettingBool("auto_skip_intro"),
