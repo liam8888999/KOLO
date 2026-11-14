@@ -3076,6 +3076,30 @@ def add_catalog_context_menu(list_item, catalog_item):
     except (AttributeError, RuntimeError, TypeError) as exc:
         log("Unable to attach Silo title actions: %s" % exc, xbmc.LOGDEBUG)
 
+def _episode_is_unwatched(progress, catalog_item=None):
+    """Apply Silo's definition: not played and no active/positive progress."""
+    state = progress if isinstance(progress, dict) else {}
+    if not state and isinstance(catalog_item, dict):
+        state = catalog_item.get("user_data") or catalog_item.get("user_state") or {}
+    if not isinstance(state, dict):
+        state = {}
+    if state.get("played") is True or state.get("completed") is True:
+        return False
+    try:
+        position = float(state.get("position_seconds") or 0)
+    except (TypeError, ValueError):
+        position = 0.0
+    return not bool(state.get("is_in_progress")) and position <= 0.0
+
+
+def _episode_spoiler_preferences(client):
+    try:
+        return client.episode_spoiler_settings()
+    except Exception as exc:
+        log("Unable to resolve episode spoiler preferences: %s" % exc, xbmc.LOGDEBUG)
+        return {}
+
+
 def build_catalog_list_item(client, catalog_item, detail=None, progress=None, series_rollup=None, season_rollup=None, accessed_from_parent=False):
     """Build a Kodi ListItem using the same metadata/watch pipeline everywhere."""
     content_id = get_content_id(catalog_item)
@@ -3088,34 +3112,43 @@ def build_catalog_list_item(client, catalog_item, detail=None, progress=None, se
     item.getVideoInfoTag().setTitle(title)
 
     set_catalog_metadata(item, catalog_item, client)
+    spoiler = _episode_spoiler_preferences(client) if media_type == "episode" else {}
+    unwatched = media_type == "episode" and _episode_is_unwatched(progress, catalog_item)
+    hide_episode_image = unwatched and spoiler.get("catalog.hide_unwatched_episode_images", False)
+    hide_episode_overview = unwatched and spoiler.get("catalog.hide_unwatched_episode_overviews", False)
+    poster = (
+        catalog_item.get("poster_url") or catalog_item.get("poster")
+        or catalog_item.get("image") or catalog_item.get("artwork")
+        or catalog_item.get("thumbnail") or (detail or {}).get("poster_url")
+        or (detail or {}).get("poster") or (detail or {}).get("image")
+    )
+    backdrop = (
+        catalog_item.get("backdrop_url") or catalog_item.get("backdrop")
+        or ((catalog_item.get("backdrop_urls") or [None])[0])
+        or (detail or {}).get("backdrop_url") or (detail or {}).get("backdrop")
+        or (((detail or {}).get("backdrop_urls") or [None])[0])
+    )
+    if hide_episode_image:
+        # Unknown provenance is protected conservatively. Prefer known show
+        # artwork where possible; never expose the episode still as a fallback.
+        if catalog_item.get("poster_is_episode_still") is not False:
+            poster = None
+        if catalog_item.get("backdrop_is_episode_still") is not False:
+            backdrop = None
+        item.setProperty("Kolo.SpoilerProtected", "true")
     set_art(
-        item,
-        client,
-        poster=(
-            catalog_item.get("poster_url")
-            or catalog_item.get("poster")
-            or catalog_item.get("image")
-            or catalog_item.get("artwork")
-            or catalog_item.get("thumbnail")
-            or (detail or {}).get("poster_url")
-            or (detail or {}).get("poster")
-            or (detail or {}).get("image")
-        ),
-        backdrop=(
-            catalog_item.get("backdrop_url")
-            or catalog_item.get("backdrop")
-            or ((catalog_item.get("backdrop_urls") or [None])[0])
-            or (detail or {}).get("backdrop_url")
-            or (detail or {}).get("backdrop")
-            or (((detail or {}).get("backdrop_urls") or [None])[0])
-        ),
+        item, client, poster=poster, backdrop=backdrop,
         logo=catalog_item.get("logo_url") or catalog_item.get("logo") or (detail or {}).get("logo_url") or (detail or {}).get("logo"),
-        still=catalog_item.get("still_url") or catalog_item.get("still") or (detail or {}).get("still_url") or (detail or {}).get("still"),
+        still=None if hide_episode_image else (catalog_item.get("still_url") or catalog_item.get("still") or (detail or {}).get("still_url") or (detail or {}).get("still")),
         banner=catalog_item.get("banner_url") or catalog_item.get("banner") or (detail or {}).get("banner_url") or (detail or {}).get("banner"),
         clearart=catalog_item.get("clear_art_url") or catalog_item.get("clearart_url") or catalog_item.get("clearart") or (detail or {}).get("clear_art_url") or (detail or {}).get("clearart_url") or (detail or {}).get("clearart"),
         discart=catalog_item.get("disc_url") or catalog_item.get("discart_url") or catalog_item.get("discart") or (detail or {}).get("disc_url") or (detail or {}).get("discart_url") or (detail or {}).get("discart"),
         landscape=catalog_item.get("landscape_url") or catalog_item.get("landscape") or (detail or {}).get("landscape_url") or (detail or {}).get("landscape") or (detail or {}).get("thumb_url"),
     )
+    if hide_episode_overview:
+        item.getVideoInfoTag().setPlot("")
+        item.getVideoInfoTag().setPlotOutline("")
+        item.setProperty("Kolo.SpoilerOverviewHidden", "true")
 
     if detail:
         set_detail_metadata(item, detail, client)
