@@ -10534,11 +10534,19 @@ def track_progress(
             if event_name == "marker_thumbnail_ready":
                 try:
                     if str(payload.get("file_id") or "") == str(playback_info.get("file_id") or ""):
-                        marker_key = (
-                            str(payload.get("kind") or "").lower(),
-                            round(float(payload.get("start_seconds") or 0.0), 3),
-                            round(float(payload.get("end_seconds") or 0.0), 3),
+                        occurrence = payload.get("occurrence") or payload.get("marker") or payload
+                        occurrence_id = str(
+                            payload.get("occurrence_id")
+                            or occurrence.get("occurrence_id")
+                            or occurrence.get("id")
+                            or ""
                         )
+                        marker_key = (
+                            str(occurrence.get("kind") or "").lower(),
+                            round(float(occurrence.get("start_seconds", occurrence.get("start", 0)) or 0.0), 3),
+                            round(float(occurrence.get("end_seconds", occurrence.get("end", 0)) or 0.0), 3),
+                        )
+                        thumbnail_url = payload.get("thumbnail_url") or occurrence.get("thumbnail_url")
                         current = json.loads(resolved_item.getProperty("Kolo.MarkerSegments") or "[]")
                         for marker in current:
                             key = (
@@ -10546,10 +10554,21 @@ def track_progress(
                                 round(float(marker.get("start_seconds", marker.get("start", 0)) or 0.0), 3),
                                 round(float(marker.get("end_seconds", marker.get("end", 0)) or 0.0), 3),
                             )
-                            if key == marker_key:
-                                marker["thumbnail_url"] = client.abs_url(payload.get("thumbnail_url"))
-                                marker["thumbnail_thumbhash"] = payload.get("thumbnail_thumbhash")
-                                marker["thumbnail_capture_seconds"] = payload.get("thumbnail_capture_seconds")
+                            same_id = occurrence_id and occurrence_id in (
+                                str(marker.get("occurrence_id") or ""),
+                                str(marker.get("id") or ""),
+                            )
+                            if same_id or key == marker_key:
+                                if thumbnail_url:
+                                    marker["thumbnail_url"] = client.abs_url(thumbnail_url)
+                                marker["thumbnail_thumbhash"] = (
+                                    payload.get("thumbnail_thumbhash")
+                                    or occurrence.get("thumbnail_thumbhash")
+                                )
+                                marker["thumbnail_capture_seconds"] = (
+                                    payload.get("thumbnail_capture_seconds")
+                                    or occurrence.get("thumbnail_capture_seconds")
+                                )
                                 break
                         resolved_item.setProperty(
                             "Kolo.MarkerSegments",
