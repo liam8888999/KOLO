@@ -9449,6 +9449,19 @@ def play(
                         return value
                     manifest = absolutize_preview_urls(manifest)
                     if manifest:
+                        info["_silo_trickplay_manifest"] = manifest
+                        info["_silo_content_id"] = str(content_id)
+                        info["_silo_file_id"] = str(file_id)
+                        expires_at = manifest.get("expires_at")
+                        try:
+                            info["_silo_trickplay_manifest_expires_at"] = (
+                                float(expires_at) if isinstance(expires_at, (int, float))
+                                else datetime.datetime.fromisoformat(
+                                    str(expires_at).replace("Z", "+00:00")
+                                ).timestamp()
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            info["_silo_trickplay_manifest_expires_at"] = 0.0
                         resolved_item.setProperty(
                             "Kolo.TrickplayManifest",
                             json.dumps(manifest, separators=(",", ":"), ensure_ascii=False),
@@ -10317,6 +10330,9 @@ def track_progress(
     last_paused = None
     progress_report_interval = 5.0
     next_progress_report_at = time.time()
+    next_trickplay_refresh_at = float(
+        playback_info.get("_silo_trickplay_manifest_expires_at") or 0.0
+    )
     next_progress_retry_not_before = 0.0
     progress_confirmed = True
     stall_started_at = None
@@ -10372,6 +10388,55 @@ def track_progress(
             break
 
         now = time.time()
+
+        # Trickplay manifests carry expiring signed sheet URLs. Refresh shortly
+        # before expiry and replace the active ListItem property for skin OSDs.
+        if (
+            resolved_item is not None
+            and playback_info.get("_silo_trickplay_manifest")
+            and next_trickplay_refresh_at
+            and now >= next_trickplay_refresh_at - 30.0
+        ):
+            try:
+                refreshed = client.trickplay_manifest(
+                    playback_info.get("_silo_content_id"),
+                    playback_info.get("_silo_file_id"),
+                )
+                if refreshed:
+                    def refresh_preview_urls(value):
+                        if isinstance(value, dict):
+                            return {
+                                key: (
+                                    client.abs_url(child)
+                                    if (key == "url" or key.endswith("_url")) and isinstance(child, str)
+                                    else refresh_preview_urls(child)
+                                )
+                                for key, child in value.items()
+                            }
+                        if isinstance(value, list):
+                            return [refresh_preview_urls(child) for child in value]
+                        return value
+                    refreshed = refresh_preview_urls(refreshed)
+                    playback_info["_silo_trickplay_manifest"] = refreshed
+                    resolved_item.setProperty(
+                        "Kolo.TrickplayManifest",
+                        json.dumps(refreshed, separators=(",", ":"), ensure_ascii=False),
+                    )
+                    expiry = refreshed.get("expires_at")
+                    try:
+                        next_trickplay_refresh_at = (
+                            float(expiry) if isinstance(expiry, (int, float))
+                            else datetime.datetime.fromisoformat(
+                                str(expiry).replace("Z", "+00:00")
+                            ).timestamp()
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        next_trickplay_refresh_at = 0.0
+                else:
+                    next_trickplay_refresh_at = now + 60.0
+            except Exception as preview_exc:
+                log("Unable to refresh Silo seek-preview manifest: %s" % preview_exc, xbmc.LOGDEBUG)
+                next_trickplay_refresh_at = now + 60.0
 
         # Handle server-pushed plan withdrawals and asynchronously generated
         # marker thumbnails on the playback thread (Kodi player APIs are not
