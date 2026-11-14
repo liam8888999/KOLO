@@ -3102,7 +3102,7 @@ def _set_trickplay_preview_properties(list_item, manifest):
     ):
         if manifest.get(field) is not None:
             list_item.setProperty("Kolo.Trickplay." + suffix, str(manifest[field]))
-    sheets = manifest.get("sheets") or []
+    sheets = manifest.get("sheets") or manifest.get("sheet_urls") or []
     list_item.setProperty("Kolo.Trickplay.SheetCount", str(len(sheets)))
     for index, sheet in enumerate(sheets):
         url = sheet.get("url") if isinstance(sheet, dict) else sheet
