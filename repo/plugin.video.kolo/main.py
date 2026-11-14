@@ -12134,7 +12134,10 @@ def router(client):
         return
 
     if action == "settings":
-        list_server_settings_menu(client)
+        if not client.cfg.get("token"):
+            open_settings(client)
+        else:
+            list_server_settings_menu(client)
         return
 
     if action == "servers":
