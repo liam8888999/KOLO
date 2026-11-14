@@ -3541,6 +3541,317 @@ def list_search_results(client, query, page=1, cursor=None, window_cursor=None):
 
 
 
+
+def _server_setting_prompt(definition, current):
+    schema = definition.get("value_schema") or {}
+    kind = str(schema.get("type") or "")
+    title = str(definition.get("label") or definition.get("key") or "Setting")
+    if schema.get("nullable"):
+        answer = xbmcgui.Dialog().select(title, ["Set a value", "Clear / inherit"])
+        if answer < 0:
+            return False, None
+        if answer == 1:
+            return True, None
+    if kind == "boolean":
+        answer = xbmcgui.Dialog().select(title, ["On", "Off"], preselect=0 if bool(current) else 1)
+        return answer >= 0, answer == 0
+    if kind == "enum":
+        options = schema.get("values") or []
+        values = [x.get("value") if isinstance(x, dict) else x for x in options]
+        labels = [str(x.get("label") or x.get("value")) if isinstance(x, dict) else str(x) for x in options]
+        if not values:
+            notify("No choices were published for this setting")
+            return False, None
+        try:
+            preselect = values.index(current)
+        except ValueError:
+            preselect = 0
+        answer = xbmcgui.Dialog().select(title, labels, preselect=preselect)
+        return answer >= 0, values[answer] if answer >= 0 else None
+    if kind in ("integer", "number"):
+        answer = xbmcgui.Dialog().input(title, defaultt="" if current is None else str(current), type=xbmcgui.INPUT_NUMERIC)
+        if answer == "":
+            return False, None
+        try:
+            value = int(answer) if kind == "integer" else float(answer)
+        except ValueError:
+            notify("Enter a valid number")
+            return False, None
+        if schema.get("minimum") is not None and value < schema["minimum"]:
+            notify("Value is below the minimum")
+            return False, None
+        if schema.get("maximum") is not None and value > schema["maximum"]:
+            notify("Value is above the maximum")
+            return False, None
+        return True, value
+    if kind in ("object", "array"):
+        answer = xbmcgui.Dialog().input(title, defaultt=json.dumps(current, ensure_ascii=False, sort_keys=True))
+        if answer == "":
+            return False, None
+        try:
+            value = json.loads(answer)
+            if kind == "object" and not isinstance(value, dict):
+                raise ValueError("Expected object")
+            if kind == "array" and not isinstance(value, list):
+                raise ValueError("Expected array")
+            return True, value
+        except (TypeError, ValueError):
+            notify("Enter valid JSON")
+            return False, None
+    if kind in ("string", "language_tag"):
+        answer = xbmcgui.Dialog().input(title, defaultt="" if current is None else str(current))
+        return answer != "", answer.strip() if answer else None
+    notify("Unsupported setting type: %s" % (kind or "unknown"))
+    return False, None
+
+
+def _server_setting_scopes(definition):
+    supported = ("account", "profile", "profile_client", "profile_device", "profile_library", "profile_series")
+    result = []
+    for entry in definition.get("allowed_scopes") or []:
+        scope = entry.get("scope") if isinstance(entry, dict) else entry
+        if scope in supported:
+            result.append(scope)
+    return result
+
+
+def _server_setting_identity(client, scope):
+    identity = {}
+    if scope == "profile_library":
+        libraries = client.libraries()
+        if not libraries:
+            notify("No libraries available")
+            return None
+        index = xbmcgui.Dialog().select("Choose library", [str(x.get("name") or x.get("title") or x.get("id")) for x in libraries])
+        if index < 0:
+            return None
+        identity["library_id"] = str(libraries[index].get("id"))
+    elif scope == "profile_series":
+        value = xbmcgui.Dialog().input("Enter Silo series ID")
+        if not value:
+            return None
+        identity["series_id"] = value.strip()
+    return identity
+
+
+def list_server_settings(client):
+    try:
+        manifest, capabilities = client.settings_contract()
+        if capabilities.get("state") != "available" or not capabilities.get("allowed", False):
+            raise SiloError("The Silo settings contract is unavailable.")
+        revision = int(capabilities.get("manifest_revision") or 0)
+        definitions = [
+            d for d in (manifest.get("definitions") or [])
+            if isinstance(d, dict) and d.get("persistence") == "remote"
+            and not d.get("deprecated")
+            and int(d.get("introduced_in") or 1) <= revision
+            and _server_setting_scopes(d)
+        ]
+        keys = [d.get("key") for d in definitions if d.get("key")]
+        effective = client.effective_setting_values(keys)
+    except Exception as exc:
+        log("Unable to load Silo server settings: %s" % exc, xbmc.LOGWARNING)
+        xbmcgui.Dialog().ok("Silo Server Settings", str(exc))
+        return
+
+    categories = {}
+    for definition in definitions:
+        category = str(definition.get("category") or "other").replace("_", " ").title()
+        categories.setdefault(category, []).append(definition)
+    category_names = sorted(categories)
+    category_index = xbmcgui.Dialog().select("User / Profile Settings", category_names)
+    if category_index < 0:
+        return
+    entries = sorted(categories[category_names[category_index]], key=lambda d: str(d.get("label") or d.get("key") or "").lower())
+    labels = []
+    for d in entries:
+        row = effective.get(d.get("key"), {})
+        value = row.get("value", d.get("default_value"))
+        shown = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if len(shown) > 42:
+            shown = shown[:39] + "..."
+        labels.append("%s: %s [%s]" % (d.get("label") or d.get("key"), shown, row.get("source") or "default"))
+    setting_index = xbmcgui.Dialog().select(category_names[category_index], labels)
+    if setting_index < 0:
+        return
+
+    definition = entries[setting_index]
+    key = str(definition.get("key") or "")
+    scopes = _server_setting_scopes(definition)
+    scope_labels = {
+        "account": "Account (all profiles)",
+        "profile": "This profile",
+        "profile_client": "All Kodi / TV devices",
+        "profile_device": "This Kodi device",
+        "profile_library": "Specific library",
+        "profile_series": "Specific series",
+    }
+    scope_index = xbmcgui.Dialog().select("Apply setting to", [scope_labels.get(x, x) for x in scopes])
+    if scope_index < 0:
+        return
+    scope = scopes[scope_index]
+    identity = _server_setting_identity(client, scope)
+    if identity is None:
+        return
+    try:
+        explicit = client.explicit_setting_values(scope, [key], identity=identity)
+        if key in explicit:
+            current = explicit[key].get("value")
+        else:
+            contextual = client.effective_setting_values(
+                [key],
+                library_ids=[identity["library_id"]] if identity.get("library_id") else None,
+                series_ids=[identity["series_id"]] if identity.get("series_id") else None,
+            )
+            current = contextual.get(key, effective.get(key, {})).get("value", definition.get("default_value"))
+    except Exception as exc:
+        log("Unable to read setting override %s: %s" % (key, exc), xbmc.LOGWARNING)
+        explicit = {}
+        current = effective.get(key, {}).get("value", definition.get("default_value"))
+
+    actions = ["Change value"] + (["Reset this override"] if key in explicit else [])
+    action = xbmcgui.Dialog().select(str(definition.get("label") or key), actions)
+    if action < 0:
+        return
+    try:
+        if action == 1:
+            if not xbmcgui.Dialog().yesno("Reset setting", "Remove this explicit override?"):
+                return
+            client.delete_setting_value(scope, key, identity=identity)
+            notify("Setting reset")
+        else:
+            changed, value = _server_setting_prompt(definition, current)
+            if not changed:
+                return
+            client.update_setting_value(scope, key, value, identity=identity)
+            notify("Setting saved")
+        xbmc.executebuiltin("Container.Refresh")
+    except Exception as exc:
+        log("Unable to update setting %s: %s" % (key, exc), xbmc.LOGWARNING)
+        xbmcgui.Dialog().ok("Unable to save setting", str(exc))
+
+
+def list_admin_user_defaults(client):
+    try:
+        manifest, capabilities = client.settings_contract()
+        values, validator = client.admin_settings_snapshot()
+        revision = int(capabilities.get("manifest_revision") or 0)
+        definitions = [
+            d for d in (manifest.get("definitions") or [])
+            if isinstance(d, dict) and d.get("persistence") == "remote"
+            and d.get("admin_default") and not d.get("deprecated")
+            and int(d.get("introduced_in") or 1) <= revision
+        ]
+    except Exception as exc:
+        xbmcgui.Dialog().ok("Global User Defaults", str(exc))
+        return
+    if not definitions:
+        xbmcgui.Dialog().ok("Global User Defaults", "No administrator-managed user defaults are available.")
+        return
+    labels = []
+    for d in definitions:
+        raw = values.get("defaults." + str(d.get("key") or ""))
+        try:
+            shown = json.dumps(json.loads(raw), ensure_ascii=False) if raw not in (None, "") else "Contract default"
+        except (TypeError, ValueError):
+            shown = str(raw)
+        labels.append("%s: %s" % (d.get("label") or d.get("key"), shown))
+    index = xbmcgui.Dialog().select("Global User Defaults", labels)
+    if index < 0:
+        return
+    definition = definitions[index]
+    key = "defaults." + str(definition.get("key") or "")
+    raw = values.get(key)
+    try:
+        current = json.loads(raw) if raw not in (None, "") else definition.get("default_value")
+    except (TypeError, ValueError):
+        current = raw
+    actions = ["Change global default"] + (["Restore contract default"] if raw not in (None, "") else [])
+    action = xbmcgui.Dialog().select(str(definition.get("label") or key), actions)
+    if action < 0:
+        return
+    if action == 1:
+        value = ""
+        confirmation = "Remove the server-wide default override?"
+    else:
+        changed, value = _server_setting_prompt(definition, current)
+        if not changed or value is None:
+            return
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        confirmation = "Use this as the default for profiles without an explicit value?"
+    if not xbmcgui.Dialog().yesno("Save global default", confirmation):
+        return
+    try:
+        client.update_admin_setting(key, value, validator)
+        notify("Global default saved")
+    except Exception as exc:
+        log("Unable to update global default %s: %s" % (key, exc), xbmc.LOGWARNING)
+        xbmcgui.Dialog().ok("Unable to save global default", str(exc))
+
+
+def list_admin_server_settings(client):
+    try:
+        values, validator = client.admin_settings_snapshot()
+        restart, sensitive = client.admin_settings_metadata()
+    except Exception as exc:
+        xbmcgui.Dialog().ok("Global Server Settings", str(exc))
+        return
+    managed = set(sensitive.get("managed_by_env") or [])
+    secrets = set(sensitive.get("configured") or [])
+    restart_keys = set(restart.get("keys") or [])
+    prefixes = tuple(restart.get("prefixes") or [])
+    entries = []
+    for key, value in values.items():
+        if str(key).startswith("defaults.") or key in managed or key in secrets:
+            continue
+        if not isinstance(value, (str, int, float, bool)):
+            continue
+        if str(key).endswith(("_secret", ".api_key", ".token", ".password")):
+            continue
+        entries.append((str(key), value))
+    entries.sort(key=lambda x: x[0])
+    if not entries:
+        xbmcgui.Dialog().ok("Global Server Settings", "No editable global settings were returned.")
+        return
+    labels = []
+    for key, value in entries:
+        shown = str(value)
+        if len(shown) > 45:
+            shown = shown[:42] + "..."
+        restart_needed = key in restart_keys or any(key.startswith(p) for p in prefixes)
+        labels.append("%s: %s%s" % (key, shown, " (restart)" if restart_needed else ""))
+    index = xbmcgui.Dialog().select("Global Server Settings", labels)
+    if index < 0:
+        return
+    key, current = entries[index]
+    value = xbmcgui.Dialog().input(key, defaultt=str(current))
+    if value == "" or not xbmcgui.Dialog().yesno("Save global setting", "Change %s to %s?" % (key, value)):
+        return
+    try:
+        client.update_admin_setting(key, value, validator)
+        notify("Global setting saved")
+        if key in restart_keys or any(key.startswith(p) for p in prefixes):
+            xbmcgui.Dialog().ok("Restart required", "Restart the Silo server for this setting to take effect.")
+    except Exception as exc:
+        log("Unable to update global setting %s: %s" % (key, exc), xbmc.LOGWARNING)
+        xbmcgui.Dialog().ok("Unable to save global setting", str(exc))
+
+
+def list_server_settings_menu(client):
+    index = xbmcgui.Dialog().select(
+        "Silo Server Settings",
+        ["User / Profile Settings", "Global User Defaults (Administrator)", "Global Server Configuration (Administrator)", "KOLO Add-on Settings"],
+    )
+    if index == 0:
+        list_server_settings(client)
+    elif index == 1:
+        list_admin_user_defaults(client)
+    elif index == 2:
+        list_admin_server_settings(client)
+    elif index == 3:
+        open_settings(client)
+
+
 def open_settings(client):
     """Open this add-on's Kodi settings dialog."""
     client.sync_settings()
@@ -11719,7 +12030,7 @@ def router(client):
         return
 
     if action == "settings":
-        open_settings(client)
+        list_server_settings_menu(client)
         return
 
     if action == "servers":
